@@ -4,6 +4,6 @@ services:
     container_name: kleinanzeigen-api
     restart: unless-stopped
     ports:
-      - "8321:8321"
+      - "8321:8000"
     environment:
       - PYTHONUNBUFFERED=1
