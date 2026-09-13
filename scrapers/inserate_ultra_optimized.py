@@ -11,10 +11,14 @@ Important:
 - Price, description, location and publication date are extracted from the
   current result cards.
 - JSON-LD embedded in each card is used as a fallback.
-- Pages are fetched sequentially by default to avoid duplicate page content
-  caused by concurrent Kleinanzeigen requests.
-- page_count is an optional upper limit. If omitted, pagination continues
-  until no new results are found.
+- Pages are fetched sequentially.
+- Pagination follows Kleinanzeigen's real "next page" href instead of
+  constructing page URLs blindly.
+- page_count is optional.
+- If page_count is omitted, pagination continues automatically up to
+  MAX_AUTOMATIC_PAGES.
+- Explicit page_count values above MAX_PAGE_LIMIT are accepted but capped
+  at MAX_PAGE_LIMIT and produce a warning.
 - Results are deduplicated by adid.
 """
 
@@ -24,7 +28,7 @@ import random
 import time
 from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 from fastapi import HTTPException
 
@@ -44,6 +48,17 @@ from utils.asyncio_optimizations import (
     EventLoopOptimizer,
     monitor_slow_coroutines,
 )
+
+
+# ---------------------------------------------------------------------------
+# Pagination limits
+# ---------------------------------------------------------------------------
+
+# Maximum number of pages when page_count is omitted.
+MAX_AUTOMATIC_PAGES = 50
+
+# Maximum number of pages that will ever be processed.
+MAX_PAGE_LIMIT = 50
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +204,6 @@ def _deduplicate_results(
     """
     Deduplicate listings by adid.
 
-    Kleinanzeigen may return the same listing more than once when multiple
-    page requests overlap or when the site serves the same result page again.
-
     The first occurrence is preserved because it corresponds to the earliest
     page encountered by the scraper.
     """
@@ -223,20 +235,21 @@ class UltraOptimizedScraper:
     """
     Optimized scraper for Kleinanzeigen search result pages.
 
-    The most important differences to the old implementation are:
+    Important pagination behavior:
 
-    1. Result extraction is restricted to:
-           #srchrslt-adtable
+    - page_count=None:
+        Follow Kleinanzeigen's actual next-page links automatically.
+        Maximum: MAX_AUTOMATIC_PAGES.
 
-    2. Pagination is sequential by default.
-       This prevents Kleinanzeigen from returning identical result pages
-       when several page requests are issued concurrently.
+    - page_count=N:
+        Follow at most N pages.
 
-    3. page_count is optional.
-       If page_count is None, pagination continues until no new listings
-       are found.
+    - page_count > MAX_PAGE_LIMIT:
+        Accepted, warning generated, and capped at MAX_PAGE_LIMIT.
 
-    4. Results are deduplicated by adid.
+    Pagination deliberately does NOT construct page 2, page 3, etc.
+    from the original search URL. Instead, the scraper reads the real
+    pagination href rendered by Kleinanzeigen and follows that URL.
     """
 
     def __init__(
@@ -373,14 +386,6 @@ class UltraOptimizedScraper:
 
                     /*
                      * Location
-                     *
-                     * Current cards contain values such as:
-                     *
-                     *   29308 Winsen (Aller)
-                     *   38100 Braunschweig
-                     *
-                     * The five-digit postal code is a much more stable
-                     * indicator than generated Tailwind class names.
                      */
                     for (const span of spans) {
                         const text = (
@@ -413,13 +418,6 @@ class UltraOptimizedScraper:
 
                     /*
                      * Price.
-                     *
-                     * Current cards use a p element containing values such
-                     * as:
-                     *
-                     *   1.550 €
-                     *   399 €
-                     *   VB
                      */
                     const paragraphs = Array.from(
                         el.querySelectorAll("p")
@@ -555,17 +553,6 @@ class UltraOptimizedScraper:
                 .strip()
             )
 
-            # Preserve "VB" rather than returning an empty value.
-            #
-            # For numeric prices, convert:
-            #
-            #   1.550 -> 1550
-            #
-            # For:
-            #
-            #   VB
-            #
-            # keep "VB".
             if price_text.upper() != "VB":
                 price_text = price_text.replace(".", "")
 
@@ -603,16 +590,10 @@ class UltraOptimizedScraper:
             # URL
             # --------------------------------------------------------------
 
-            if (
-                href.startswith("http://")
-                or href.startswith("https://")
-            ):
-                listing_url = href
-            else:
-                listing_url = (
-                    "https://www.kleinanzeigen.de"
-                    + href
-                )
+            listing_url = urljoin(
+                "https://www.kleinanzeigen.de",
+                href,
+            )
 
             return {
                 "adid": adid,
@@ -647,6 +628,163 @@ class UltraOptimizedScraper:
             return ""
 
     # ----------------------------------------------------------------------
+    # Pagination discovery
+    # ----------------------------------------------------------------------
+
+    async def _get_next_page_url(
+        self,
+        page,
+        current_url: str,
+    ) -> Optional[str]:
+        """
+        Return Kleinanzeigen's actual next-page URL.
+
+        This is intentionally based on the rendered pagination instead of
+        constructing URLs such as:
+
+            /s-seite:2?keywords=...
+
+        because the current Kleinanzeigen URL structure places the page
+        component inside the search path.
+
+        Several selectors are tried to remain compatible with markup changes.
+        """
+        try:
+            selectors = [
+                # Current/typical next-page links.
+                ".pagination-next a[href]",
+                "a.pagination-next[href]",
+
+                # Generic pagination structures.
+                "nav[aria-label*='Pagination' i] a[rel='next'][href]",
+                "nav[aria-label*='Seitennavigation' i] a[rel='next'][href]",
+                "a[rel='next'][href]",
+
+                # Fallback based on accessible text.
+                ".pagination a[aria-label*='nächste' i][href]",
+                ".pagination a[title*='nächste' i][href]",
+                ".pagination a[aria-label*='next' i][href]",
+                ".pagination a[title*='next' i][href]",
+            ]
+
+            for selector in selectors:
+                try:
+                    link = await page.query_selector(
+                        selector
+                    )
+
+                    if not link:
+                        continue
+
+                    href = await link.get_attribute(
+                        "href"
+                    )
+
+                    if not href:
+                        continue
+
+                    next_url = urljoin(
+                        current_url,
+                        href,
+                    )
+
+                    if next_url == current_url:
+                        continue
+
+                    return next_url
+
+                except Exception:
+                    continue
+
+            # ----------------------------------------------------------
+            # Last fallback:
+            #
+            # Search all pagination links and identify one whose href
+            # contains a /seite:N/ component greater than the current page.
+            # ----------------------------------------------------------
+
+            try:
+                current_page_match = None
+
+                import re
+
+                match = re.search(
+                    r"/seite:(\d+)",
+                    current_url,
+                    re.IGNORECASE,
+                )
+
+                if match:
+                    current_page_match = int(
+                        match.group(1)
+                    )
+
+                links = await page.query_selector_all(
+                    "a[href]"
+                )
+
+                candidates = []
+
+                for link in links:
+                    try:
+                        href = await link.get_attribute(
+                            "href"
+                        )
+
+                        if not href:
+                            continue
+
+                        next_url = urljoin(
+                            current_url,
+                            href,
+                        )
+
+                        page_match = re.search(
+                            r"/seite:(\d+)",
+                            next_url,
+                            re.IGNORECASE,
+                        )
+
+                        if not page_match:
+                            continue
+
+                        candidate_page = int(
+                            page_match.group(1)
+                        )
+
+                        if (
+                            current_page_match is not None
+                            and candidate_page
+                            <= current_page_match
+                        ):
+                            continue
+
+                        candidates.append(
+                            (
+                                candidate_page,
+                                next_url,
+                            )
+                        )
+
+                    except Exception:
+                        continue
+
+                if candidates:
+                    candidates.sort(
+                        key=lambda item: item[0]
+                    )
+
+                    return candidates[0][1]
+
+            except Exception:
+                pass
+
+            return None
+
+        except Exception:
+            return None
+
+    # ----------------------------------------------------------------------
     # Fetch one page
     # ----------------------------------------------------------------------
 
@@ -666,9 +804,19 @@ class UltraOptimizedScraper:
         List[Dict],
         PageMetrics,
         Dict[str, str],
+        Optional[str],
     ]:
         """
         Fetch and parse one Kleinanzeigen search-result page.
+
+        Returns:
+
+            (
+                results,
+                metrics,
+                extras,
+                next_page_url,
+            )
         """
         logger = ErrorLogger(
             f"ultra_scraper_page_{page_num}"
@@ -725,6 +873,17 @@ class UltraOptimizedScraper:
                         )
                     )
 
+                    # ------------------------------------------------------
+                    # Discover the real next page BEFORE closing the page.
+                    # ------------------------------------------------------
+
+                    next_page_url = (
+                        await self._get_next_page_url(
+                            page,
+                            url,
+                        )
+                    )
+
                     # Optional selectors requested by callers.
                     extras: Dict[str, str] = {}
 
@@ -761,6 +920,7 @@ class UltraOptimizedScraper:
                         results,
                         metrics,
                         extras,
+                        next_page_url,
                     )
 
                 except Exception as exc:
@@ -828,7 +988,7 @@ class UltraOptimizedScraper:
                 results_count=0,
             )
 
-            return [], metrics, {}
+            return [], metrics, {}, None
 
     # ----------------------------------------------------------------------
     # Main scraper
@@ -847,28 +1007,19 @@ class UltraOptimizedScraper:
         """
         Scrape Kleinanzeigen search-result pages.
 
-        page_count:
-            Optional maximum number of pages.
+        page_count=None:
+            Automatically follow the real Kleinanzeigen pagination links,
+            with a hard maximum of 50 pages.
 
-            None:
-                No explicit page limit. Pages are fetched sequentially until
-                Kleinanzeigen no longer provides new result IDs.
+        page_count=N:
+            Fetch at most N pages.
 
-            1, 2, 3, ...:
-                Explicit upper limit.
+        page_count > 50:
+            Do not fail the request. Generate a warning and cap the actual
+            processing at 50 pages.
 
-        IMPORTANT:
-
-        The default is intentionally None rather than 1.
-
-        Kleinanzeigen can have substantially more than one result page.
-        With page_count omitted, this implementation therefore follows the
-        pagination automatically.
-
-        Pages are deliberately fetched sequentially. Concurrent requests to
-        Kleinanzeigen can return the same result page multiple times, which
-        produces large numbers of duplicates. Sequential pagination together
-        with adid-based deduplication avoids this.
+        The scraper does NOT construct page 2/3/4 URLs itself. It follows
+        Kleinanzeigen's actual next-page href returned by the previous page.
         """
         logger = ErrorLogger(
             "ultra_scraper"
@@ -889,10 +1040,25 @@ class UltraOptimizedScraper:
             )
 
             # --------------------------------------------------------------
-            # Validate page_count
+            # Validate and normalize page_count
             # --------------------------------------------------------------
 
+            requested_page_count = page_count
+
+            effective_page_count = None
+
             if page_count is not None:
+                try:
+                    page_count = int(page_count)
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "page_count must be an integer "
+                            "when specified"
+                        ),
+                    )
+
                 if page_count < 1:
                     raise HTTPException(
                         status_code=400,
@@ -902,13 +1068,37 @@ class UltraOptimizedScraper:
                         ),
                     )
 
-                # Kleinanzeigen supports substantially more than 20 pages
-                # in the browser. The old API limit of 20 therefore must not
-                # be enforced here.
-                #
-                # An explicitly supplied value is treated only as an upper
-                # limit by the scraper.
-                page_count = int(page_count)
+                if page_count > MAX_PAGE_LIMIT:
+                    warning_manager.add_warning(
+                        (
+                            f"page_count={page_count} exceeds the "
+                            f"maximum of {MAX_PAGE_LIMIT}. "
+                            f"Only the first {MAX_PAGE_LIMIT} pages "
+                            "will be processed."
+                        ),
+                        ErrorSeverity.MEDIUM,
+                        context_info.context,
+                        affected_items=[
+                            "page_count"
+                        ],
+                        impact_description=(
+                            "The scraper protects against excessively "
+                            "large pagination requests."
+                        ),
+                    )
+
+                    effective_page_count = (
+                        MAX_PAGE_LIMIT
+                    )
+                else:
+                    effective_page_count = page_count
+
+            else:
+                # No explicit limit:
+                # automatically paginate, but never beyond 50 pages.
+                effective_page_count = (
+                    MAX_AUTOMATIC_PAGES
+                )
 
             # --------------------------------------------------------------
             # Price path
@@ -939,11 +1129,17 @@ class UltraOptimizedScraper:
                 )
 
             # --------------------------------------------------------------
-            # Search URL
+            # Initial search URL
+            #
+            # IMPORTANT:
+            #
+            # Only the initial URL is constructed here.
+            # Subsequent pages come from Kleinanzeigen's actual pagination
+            # href discovered on the current page.
             # --------------------------------------------------------------
 
             search_path = (
-                f"{price_path}/s-seite:{{page}}"
+                f"{price_path}/s-seite:1"
             )
 
             params: Dict[str, Any] = {}
@@ -963,7 +1159,7 @@ class UltraOptimizedScraper:
                 else ""
             )
 
-            search_url = (
+            current_page_url = (
                 base_url
                 + search_path
                 + param_string
@@ -983,31 +1179,60 @@ class UltraOptimizedScraper:
 
             seen_adids = set()
 
+            # Keep track of already visited URLs as an additional safety
+            # mechanism against a broken pagination link causing a loop.
+            visited_page_urls = set()
+
             page_num = 1
             stop_reason = None
 
             while True:
 
                 # ----------------------------------------------------------
-                # Explicit page limit
+                # Hard page limit
                 # ----------------------------------------------------------
 
                 if (
-                    page_count is not None
-                    and page_num > page_count
+                    effective_page_count is not None
+                    and page_num > effective_page_count
                 ):
+                    if (
+                        requested_page_count is None
+                    ):
+                        stop_reason = (
+                            "automatic_page_limit_reached"
+                        )
+                    else:
+                        stop_reason = (
+                            "page_count_limit_reached"
+                        )
+
+                    break
+
+                # ----------------------------------------------------------
+                # Pagination loop protection
+                # ----------------------------------------------------------
+
+                if current_page_url in visited_page_urls:
+                    logger.logger.warning(
+                        "[OVERVIEW] Pagination returned an already "
+                        f"visited URL on page {page_num}: "
+                        f"{current_page_url}"
+                    )
+
                     stop_reason = (
-                        "page_count_limit_reached"
+                        "pagination_url_repeated"
                     )
                     break
 
-                page_url = search_url.format(
-                    page=page_num
+                visited_page_urls.add(
+                    current_page_url
                 )
 
                 logger.logger.info(
                     "[OVERVIEW] Sequential pagination: "
-                    f"fetching page {page_num}"
+                    f"fetching page {page_num}: "
+                    f"{current_page_url}"
                 )
 
                 try:
@@ -1015,9 +1240,10 @@ class UltraOptimizedScraper:
                         page_results,
                         page_metrics,
                         _,
+                        next_page_url,
                     ) = await (
                         self.ultra_optimized_fetch_page(
-                            page_url,
+                            current_page_url,
                             page_num,
                         )
                     )
@@ -1031,7 +1257,7 @@ class UltraOptimizedScraper:
                                     "sequential_page_fetch"
                                 ),
                                 page_number=page_num,
-                                url=page_url,
+                                url=current_page_url,
                             ),
                             "page_execution",
                         )
@@ -1106,17 +1332,24 @@ class UltraOptimizedScraper:
                     seen_adids.add(adid)
                     new_results.append(result)
 
+                duplicate_count = (
+                    len(page_results)
+                    - len(new_results)
+                )
+
                 logger.logger.info(
                     "[OVERVIEW] Page "
                     f"{page_num}: "
                     f"{len(page_results)} extracted, "
                     f"{len(new_results)} new, "
-                    f"{len(page_results) - len(new_results)} duplicates"
+                    f"{duplicate_count} duplicates"
                 )
 
                 # ----------------------------------------------------------
                 # Publication-date filtering
                 # ----------------------------------------------------------
+
+                reached_min_publish_date = False
 
                 if min_publish_date:
                     if _page_has_old_listings(
@@ -1130,13 +1363,7 @@ class UltraOptimizedScraper:
                             )
                         )
 
-                        # Kleinanzeigen results are normally ordered newest
-                        # first. Once an older listing occurs, subsequent
-                        # pages are no longer needed for a date-bounded
-                        # search.
-                        stop_reason = (
-                            "min_publish_date_reached"
-                        )
+                        reached_min_publish_date = True
 
                 # ----------------------------------------------------------
                 # Add results
@@ -1157,26 +1384,56 @@ class UltraOptimizedScraper:
                         "Pagination finished."
                     )
 
-                    if stop_reason is None:
-                        stop_reason = (
-                            "no_new_results"
-                        )
-
+                    stop_reason = (
+                        "no_new_results"
+                    )
                     break
 
                 # ----------------------------------------------------------
-                # If min_publish_date caused an early stop
+                # Stop at min_publish_date
                 # ----------------------------------------------------------
 
-                if (
-                    stop_reason
-                    == "min_publish_date_reached"
-                ):
+                if reached_min_publish_date:
+                    logger.logger.info(
+                        "[OVERVIEW] Page "
+                        f"{page_num} contained listings older than "
+                        "min_publish_date. Pagination finished."
+                    )
+
+                    stop_reason = (
+                        "min_publish_date_reached"
+                    )
                     break
 
                 # ----------------------------------------------------------
-                # Prepare next page
+                # No next page
                 # ----------------------------------------------------------
+
+                if not next_page_url:
+                    logger.logger.info(
+                        "[OVERVIEW] Page "
+                        f"{page_num} has no next-page link. "
+                        "Pagination finished."
+                    )
+
+                    stop_reason = (
+                        "no_next_page"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # Next page
+                # ----------------------------------------------------------
+
+                logger.logger.info(
+                    "[OVERVIEW] Page "
+                    f"{page_num} -> next page: "
+                    f"{next_page_url}"
+                )
+
+                current_page_url = (
+                    next_page_url
+                )
 
                 page_num += 1
 
@@ -1186,7 +1443,7 @@ class UltraOptimizedScraper:
                     gc.collect()
 
                 # Small randomized delay between pages.
-
+                #
                 # This is intentionally short. The purpose is not to make
                 # scraping slow, but to avoid hammering the same endpoint
                 # with a burst of requests.
@@ -1337,13 +1594,27 @@ class UltraOptimizedScraper:
                     ),
                     "optimization_level": "ultra",
                     "memory_optimized": True,
+
                     "pagination_mode": (
-                        "unlimited_until_exhausted"
-                        if page_count is None
+                        "automatic_until_exhausted"
+                        if requested_page_count is None
                         else "explicit_limit"
                     ),
-                    "page_limit": page_count,
+
+                    "page_limit": (
+                        effective_page_count
+                    ),
+
+                    "requested_page_count": (
+                        requested_page_count
+                    ),
+
+                    "automatic_page_limit": (
+                        MAX_AUTOMATIC_PAGES
+                    ),
+
                     "stop_reason": stop_reason,
+
                     "uvloop_enabled": hasattr(
                         asyncio.get_event_loop(),
                         "_selector",
@@ -1357,6 +1628,8 @@ class UltraOptimizedScraper:
                     "advanced_task_management",
                     "sequential_pagination",
                     "automatic_pagination",
+                    "real_next_page_href",
+                    "pagination_loop_protection",
                     "adid_deduplication",
                     "intelligent_page_stop",
                     "context_pooling",
@@ -1425,11 +1698,15 @@ async def ultra_optimized_scrape_inserate(
     """
     Convenience wrapper for direct use.
 
-    page_count=None means:
-        Follow Kleinanzeigen pagination until no new results are found.
+    page_count=None:
+        Automatically follow Kleinanzeigen pagination until no next page
+        exists, no new results are found, or 50 pages have been processed.
 
-    page_count=N means:
+    page_count=N:
         Fetch at most N pages.
+
+    page_count > 50:
+        Accepted with a warning and capped at 50 pages.
     """
     scraper = await (
         create_ultra_optimized_scraper(
