@@ -1,17 +1,25 @@
 """
-Ultra-optimized scraper using advanced asyncio patterns for maximum performance.
+Ultra-optimized Kleinanzeigen search-result scraper.
 
-This implementation applies production-grade asyncio optimizations to achieve
-the best possible performance for multi-page scraping operations.
+This implementation is designed for the current Kleinanzeigen result-card
+markup and keeps the public interface of the original ultra scraper.
+
+Important:
+- Search results are scoped to #srchrslt-adtable.
+- Listings from "Weitere Ergebnisse in anderen Orten" are ignored.
+- Current Astro/Tailwind result-card markup is supported.
+- Price, description, location and publication date are extracted from the
+  current result cards.
+- JSON-LD embedded in each card is used as a fallback.
 """
 
 import asyncio
-import time
-import random
 import gc
+import random
+import time
 from datetime import datetime, date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
-from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import HTTPException
 
@@ -33,278 +41,555 @@ from utils.asyncio_optimizations import (
 )
 
 
-def _page_has_old_listings(results: list, min_publish_date: datetime) -> bool:
-    """Return True if any listing on this page was published before min_publish_date."""
-    for r in results:
-        pub = r.get("published_at")
-        if pub and datetime.fromisoformat(pub) < min_publish_date:
-            return True
+def _page_has_old_listings(
+    results: list,
+    min_publish_date: datetime,
+) -> bool:
+    """Return True if a listing on this page is older than the requested date."""
+    for result in results:
+        published = result.get("published_at")
+
+        if not published:
+            continue
+
+        try:
+            if datetime.fromisoformat(published) < min_publish_date:
+                return True
+        except (TypeError, ValueError):
+            continue
+
     return False
 
 
-def _filter_by_min_publish_date(results: list, min_publish_date: datetime) -> list:
-    """Remove listings published before min_publish_date. Null published_at entries are kept."""
-    out = []
-    for r in results:
-        pub = r.get("published_at")
-        if pub is None or datetime.fromisoformat(pub) >= min_publish_date:
-            out.append(r)
-    return out
+def _filter_by_min_publish_date(
+    results: list,
+    min_publish_date: datetime,
+) -> list:
+    """
+    Remove listings published before min_publish_date.
+
+    Listings with an unknown publication date are retained.
+    """
+    filtered = []
+
+    for result in results:
+        published = result.get("published_at")
+
+        if not published:
+            filtered.append(result)
+            continue
+
+        try:
+            if datetime.fromisoformat(published) >= min_publish_date:
+                filtered.append(result)
+        except (TypeError, ValueError):
+            filtered.append(result)
+
+    return filtered
 
 
 def _parse_kleinanzeigen_date(text: str) -> Optional[str]:
-    """Convert a Kleinanzeigen listing date string to an ISO 8601 datetime string.
-
-    Handles three formats:
-      'Heute, 22:06'   → today's date at that time
-      'Gestern, 19:30' → yesterday's date at that time
-      '26.04.2026'     → that date at midnight (no time shown for older listings)
-    Returns None if the text is empty or unparseable.
     """
-    text = text.strip()
+    Convert a Kleinanzeigen publication date into ISO 8601.
+
+    Supported examples:
+
+        Heute, 08:08
+        Gestern, 18:30
+        10.09.2026
+
+    Unknown formats return None.
+    """
     if not text:
         return None
+
+    text = str(text).strip()
+
+    if not text:
+        return None
+
     try:
         today = date.today()
+
         if text.startswith("Heute,"):
-            h, m = map(int, text.split(",", 1)[1].strip().split(":"))
-            return datetime(today.year, today.month, today.day, h, m).isoformat()
-        if text.startswith("Gestern,"):
-            yesterday = today - timedelta(days=1)
-            h, m = map(int, text.split(",", 1)[1].strip().split(":"))
+            time_part = text.split(",", 1)[1].strip()
+            hour, minute = map(int, time_part.split(":"))
+
             return datetime(
-                yesterday.year, yesterday.month, yesterday.day, h, m
+                today.year,
+                today.month,
+                today.day,
+                hour,
+                minute,
             ).isoformat()
+
+        if text.startswith("Gestern,"):
+            time_part = text.split(",", 1)[1].strip()
+            hour, minute = map(int, time_part.split(":"))
+
+            yesterday = today - timedelta(days=1)
+
+            return datetime(
+                yesterday.year,
+                yesterday.month,
+                yesterday.day,
+                hour,
+                minute,
+            ).isoformat()
+
+        # Older listings:
         # DD.MM.YYYY
-        d, mo, y = text.split(".")
-        return datetime(int(y), int(mo), int(d)).isoformat()
+        day, month, year = text.split(".")
+
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+        ).isoformat()
+
     except Exception:
         return None
 
 
 def _clean_location_text(text: str) -> str:
-    """Clean location text from Kleinanzeigen result cards."""
+    """Normalize location text returned by a Kleinanzeigen result card."""
     if not text:
         return ""
 
     value = str(text).replace("\xa0", " ")
-    lines = [line.strip() for line in value.splitlines() if line.strip()]
+
+    lines = [
+        line.strip()
+        for line in value.splitlines()
+        if line.strip()
+    ]
+
     value = " ".join(lines)
     value = " ".join(value.split())
 
-    for bad in ["Ort", "Standort"]:
-        if value.lower().startswith(bad.lower()):
-            value = value[len(bad) :].strip(" :-|•")
+    for prefix in ("Ort", "Standort"):
+        if value.lower().startswith(prefix.lower()):
+            value = value[len(prefix):].strip(" :-|•")
 
     return value.strip()
 
 
 class UltraOptimizedScraper:
     """
-    Ultra-optimized scraper implementing all advanced asyncio patterns.
+    Optimized scraper for Kleinanzeigen search result pages.
 
-    Features:
-    - uvloop integration for 2-4x performance boost
-    - Memory-conscious processing with automatic GC
-    - Advanced task management with weak references
-    - Connection pooling and reuse
-    - Intelligent concurrency control
+    The most important difference to the old implementation is that result
+    extraction is restricted to:
+
+        #srchrslt-adtable
+
+    This prevents additional listings from sections such as
+    "Weitere Ergebnisse in anderen Orten" from being returned.
     """
 
-    def __init__(self, browser_manager: OptimizedPlaywrightManager):
+    def __init__(
+        self,
+        browser_manager: OptimizedPlaywrightManager,
+    ):
         self.browser_manager = browser_manager
+
         self.task_manager = HighPerformanceTaskManager(
             max_concurrent=browser_manager._semaphore._value
         )
+
         self.memory_processor = MemoryOptimizedProcessor(
             max_concurrent=browser_manager._semaphore._value,
-            gc_threshold=50,  # More frequent GC for memory efficiency
+            gc_threshold=50,
         )
 
-        # Setup uvloop if available
         EventLoopOptimizer.setup_uvloop()
 
     @monitor_slow_coroutines(threshold=0.5)
-    async def extract_ads_optimized(self, page) -> List[Dict[str, Any]]:
+    async def extract_ads_optimized(
+        self,
+        page,
+    ) -> List[Dict[str, Any]]:
         """
-        Optimized ad extraction with memory management.
+        Extract listings from the actual Kleinanzeigen search result list.
 
-        Uses efficient DOM querying and immediate result processing
-        to minimize memory usage.
+        Current markup:
+
+            <ul id="srchrslt-adtable">
+                <li data-clickable="card">
+                    <article data-adid="...">
+                        ...
+                    </article>
+                </li>
+            </ul>
+
+        IMPORTANT:
+
+        Do not query article[data-adid] globally.
+
+        Kleinanzeigen can place additional listings elsewhere on the page,
+        for example under "Weitere Ergebnisse in anderen Orten". Those
+        listings are not part of the requested search result list.
         """
         try:
-            # Use more specific selector to reduce DOM traversal
-            # NOTE: Astro relaunch dropped the .ad-listitem wrapper — match
-            # listing articles directly (still skips top-ads via class check).
-            items = await page.query_selector_all("article[data-adid]")
+            selector = (
+                "#srchrslt-adtable > "
+                "li[data-clickable='card'] "
+                "article[data-adid]"
+            )
 
-            results = []
+            items = await page.query_selector_all(selector)
 
-            # Process items in batches to control memory usage
+            results: List[Dict[str, Any]] = []
+
             batch_size = 10
-            for i in range(0, len(items), batch_size):
-                batch = items[i : i + batch_size]
 
-                # Process batch concurrently
-                batch_tasks = []
-                for item in batch:
-                    batch_tasks.append(self._extract_single_ad(item))
+            for index in range(
+                0,
+                len(items),
+                batch_size,
+            ):
+                batch = items[index:index + batch_size]
+
+                tasks = [
+                    self._extract_single_ad(article)
+                    for article in batch
+                ]
 
                 batch_results = await asyncio.gather(
-                    *batch_tasks, return_exceptions=True
+                    *tasks,
+                    return_exceptions=True,
                 )
 
-                # Filter successful results
                 for result in batch_results:
                     if isinstance(result, dict):
                         results.append(result)
 
-                # Periodic memory cleanup
-                if i % (batch_size * 5) == 0:
+                if index % (batch_size * 5) == 0:
                     gc.collect()
 
             return results
 
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=str(exc),
+            )
 
-    async def _extract_single_ad(self, article) -> Dict[str, Any]:
-        """Extract data from a single ad article element."""
+    async def _extract_single_ad(
+        self,
+        article,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Extract one listing from the current Kleinanzeigen result-card DOM.
+        """
         try:
-            data_adid = await article.get_attribute("data-adid")
-            data_href = await article.get_attribute("data-href")
+            adid = await article.get_attribute("data-adid")
+            href = await article.get_attribute("data-href")
 
-            if not data_adid or not data_href:
+            if not adid or not href:
                 return None
 
+            # Current result-card title.
             title_task = self._get_text_content(
-                article, "h2.text-module-begin a.ellipsis"
-            )
-            price_task = self._get_text_content(
                 article,
-                "p.aditem-main--middle--price-shipping--price, [class*='price']",
+                "h3 a",
             )
-            desc_task = self._get_text_content(
-                article, "p.aditem-main--middle--description"
-            )
-            date_task = self._get_text_content(article, ".aditem-main--top--right")
 
-            location_task = article.evaluate(
+            # Current result-card description preview.
+            description_task = self._get_text_content(
+                article,
+                "h3 + p",
+            )
+
+            # Extract price, location and date in one browser-side operation.
+            metadata_task = article.evaluate(
                 """
                 (el) => {
-                    const selectors = [
-                        ".aditem-main--top--left",
-                        ".aditem-main--top--left--location",
-                        "[class*='aditem-main--top--left']",
-                        "[class*='location']",
-                        "[class*='Location']"
-                    ];
+                    const result = {
+                        price: "",
+                        location: "",
+                        date: ""
+                    };
 
-                    for (const selector of selectors) {
-                        const node = el.querySelector(selector);
-                        if (node && node.innerText && node.innerText.trim()) {
-                            return node.innerText.trim();
+                    const spans = Array.from(
+                        el.querySelectorAll("span")
+                    );
+
+                    /*
+                     * Location
+                     *
+                     * Current cards contain values such as:
+                     *
+                     *   29308 Winsen (Aller)
+                     *   38100 Braunschweig
+                     *
+                     * The five-digit postal code is a much more stable
+                     * indicator than generated Tailwind class names.
+                     */
+                    for (const span of spans) {
+                        const text = (
+                            span.innerText || ""
+                        ).trim();
+
+                        if (/\\b\\d{5}\\b/.test(text)) {
+                            result.location = text;
+                            break;
                         }
                     }
 
-                    const text = el.innerText || "";
-                    const lines = text
-                        .split("\\n")
-                        .map(line => line.trim())
-                        .filter(Boolean);
+                    /*
+                     * Publication date.
+                     */
+                    for (const span of spans) {
+                        const text = (
+                            span.innerText || ""
+                        ).trim();
 
-                    const zipLine = lines.find(line => /\\b\\d{5}\\b/.test(line));
-                    if (zipLine) {
-                        return zipLine;
+                        if (
+                            /^\\d{2}\\.\\d{2}\\.\\d{4}$/.test(text) ||
+                            /^Heute,\\s*\\d{1,2}:\\d{2}$/.test(text) ||
+                            /^Gestern,\\s*\\d{1,2}:\\d{2}$/.test(text)
+                        ) {
+                            result.date = text;
+                            break;
+                        }
                     }
 
-                    return "";
+                    /*
+                     * Price.
+                     *
+                     * Current cards use a p element containing values such
+                     * as:
+                     *
+                     *   1.550 €
+                     *   399 €
+                     *   VB
+                     */
+                    const paragraphs = Array.from(
+                        el.querySelectorAll("p")
+                    );
+
+                    for (const paragraph of paragraphs) {
+                        const text = (
+                            paragraph.innerText || ""
+                        ).trim();
+
+                        if (
+                            text.includes("€") ||
+                            text === "VB"
+                        ) {
+                            result.price = text;
+                            break;
+                        }
+                    }
+
+                    return result;
                 }
                 """
             )
 
             (
                 title_text,
-                price_text,
                 description_text,
-                date_raw,
-                location_raw,
+                metadata,
             ) = await asyncio.gather(
                 title_task,
-                price_task,
-                desc_task,
-                date_task,
-                location_task,
+                description_task,
+                metadata_task,
                 return_exceptions=True,
             )
 
-            # Astro layout: h2 is gone — fall back to the article's embedded
-            # JSON-LD (<script type="application/ld+json">, fields
-            # title/description/creditText) when the classic selector misses.
-            if not (isinstance(title_text, str) and title_text.strip()):
-                try:
-                    ld_raw = await article.evaluate(
-                        """(el) => {
-                            const s = el.querySelector(
-                                'script[type="application/ld+json"]'
-                            );
-                            if (!s) return null;
-                            try { const j = JSON.parse(s.textContent);
-                                  return j.title || j.name || null; }
-                            catch (e) { return null; }
-                        }"""
-                    )
-                    if isinstance(ld_raw, str) and ld_raw.strip():
-                        title_text = ld_raw.strip()
-                except Exception:
-                    pass
+            # Never allow an exception object to propagate into the result.
+            if not isinstance(title_text, str):
+                title_text = ""
 
-            if isinstance(price_text, str):
-                price_text = (
-                    price_text.replace("€", "")
-                    .replace("VB", "")
-                    .replace(".", "")
-                    .strip()
+            if not isinstance(description_text, str):
+                description_text = ""
+
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            # --------------------------------------------------------------
+            # JSON-LD fallback
+            # --------------------------------------------------------------
+
+            ld_data: Dict[str, str] = {}
+
+            try:
+                ld_data = await article.evaluate(
+                    """
+                    (el) => {
+                        const script = el.querySelector(
+                            'script[type="application/ld+json"]'
+                        );
+
+                        if (!script) {
+                            return {};
+                        }
+
+                        try {
+                            const data = JSON.parse(
+                                script.textContent || "{}"
+                            );
+
+                            return {
+                                title:
+                                    data.title ||
+                                    data.name ||
+                                    "",
+
+                                description:
+                                    data.description ||
+                                    ""
+                            };
+                        } catch (error) {
+                            return {};
+                        }
+                    }
+                    """
                 )
-            else:
+
+                if not isinstance(ld_data, dict):
+                    ld_data = {}
+
+            except Exception:
+                ld_data = {}
+
+            # --------------------------------------------------------------
+            # Title fallback
+            # --------------------------------------------------------------
+
+            if not title_text.strip():
+                fallback_title = ld_data.get("title", "")
+
+                if isinstance(fallback_title, str):
+                    title_text = fallback_title.strip()
+
+            # --------------------------------------------------------------
+            # Description fallback
+            # --------------------------------------------------------------
+
+            if not description_text.strip():
+                fallback_description = ld_data.get(
+                    "description",
+                    "",
+                )
+
+                if isinstance(
+                    fallback_description,
+                    str,
+                ):
+                    description_text = (
+                        fallback_description.strip()
+                    )
+
+            # --------------------------------------------------------------
+            # Price
+            # --------------------------------------------------------------
+
+            price_text = metadata.get("price", "")
+
+            if not isinstance(price_text, str):
                 price_text = ""
 
-            published_at = _parse_kleinanzeigen_date(
-                date_raw if isinstance(date_raw, str) else ""
+            price_text = (
+                price_text
+                .replace("\xa0", " ")
+                .replace("€", "")
+                .strip()
+            )
+
+            # Preserve "VB" rather than returning an empty value.
+            #
+            # For numeric prices, convert:
+            #
+            #   1.550 -> 1550
+            #
+            # For:
+            #
+            #   VB
+            #
+            # keep "VB".
+            if price_text.upper() != "VB":
+                price_text = price_text.replace(".", "")
+
+            # --------------------------------------------------------------
+            # Location
+            # --------------------------------------------------------------
+
+            location_raw = metadata.get(
+                "location",
+                "",
             )
 
             location_text = _clean_location_text(
-                location_raw if isinstance(location_raw, str) else ""
+                location_raw
+                if isinstance(location_raw, str)
+                else ""
             )
 
+            # --------------------------------------------------------------
+            # Publication date
+            # --------------------------------------------------------------
+
+            date_raw = metadata.get(
+                "date",
+                "",
+            )
+
+            published_at = _parse_kleinanzeigen_date(
+                date_raw
+                if isinstance(date_raw, str)
+                else ""
+            )
+
+            # --------------------------------------------------------------
+            # URL
+            # --------------------------------------------------------------
+
+            if href.startswith("http://") or href.startswith("https://"):
+                listing_url = href
+            else:
+                listing_url = (
+                    "https://www.kleinanzeigen.de"
+                    + href
+                )
+
             return {
-                "adid": data_adid,
-                "url": f"https://www.kleinanzeigen.de{data_href}",
-                "title": title_text if isinstance(title_text, str) else "",
+                "adid": adid,
+                "url": listing_url,
+                "title": title_text.strip(),
                 "price": price_text,
                 "location": location_text,
-                "description": description_text
-                if isinstance(description_text, str)
-                else "",
+                "description": description_text.strip(),
                 "published_at": published_at,
             }
 
         except Exception:
             return None
 
-    async def _get_text_content(self, parent_element, selector: str) -> str:
-        """Efficiently get text content from an element."""
+    async def _get_text_content(
+        self,
+        parent_element,
+        selector: str,
+    ) -> str:
+        """Safely retrieve text content from a child element."""
         try:
-            element = await parent_element.query_selector(selector)
+            element = await parent_element.query_selector(
+                selector
+            )
+
             if element:
                 return await element.inner_text()
+
             return ""
+
         except Exception:
             return ""
 
     @monitor_slow_coroutines(
         threshold=2.0,
-        context_fn=lambda self, url, page_num, *a, **kw: (
+        context_fn=lambda self, url, page_num, *args, **kwargs: (
             f"OVERVIEW page {page_num}: {url}"
         ),
     )
@@ -314,61 +599,95 @@ class UltraOptimizedScraper:
         page_num: int,
         retry_count: int = 2,
         extra_selectors: Dict[str, str] = None,
-    ) -> Tuple[List[Dict], PageMetrics, Dict[str, str]]:
+    ) -> Tuple[
+        List[Dict],
+        PageMetrics,
+        Dict[str, str],
+    ]:
         """
-        Ultra-optimized page fetching with all performance enhancements.
+        Fetch and parse one Kleinanzeigen search-result page.
+        """
+        logger = ErrorLogger(
+            f"ultra_scraper_page_{page_num}"
+        )
 
-        Features:
-        - Context reuse from pool
-        - Intelligent retry with exponential backoff
-        - Memory-conscious processing
-        - Comprehensive error handling
-        """
-        logger = ErrorLogger(f"ultra_scraper_page_{page_num}")
-        logger.logger.info(f"[OVERVIEW] Fetching page {page_num}: {url}")
+        logger.logger.info(
+            f"[OVERVIEW] Fetching page "
+            f"{page_num}: {url}"
+        )
 
         with error_handling_context(
-            operation="ultra_fetch_page", page_number=page_num, url=url, logger=logger
+            operation="ultra_fetch_page",
+            page_number=page_num,
+            url=url,
+            logger=logger,
         ):
             start_time = time.time()
             last_error = None
 
-            for attempt in range(retry_count + 1):
+            for attempt in range(
+                retry_count + 1
+            ):
                 context = None
                 page = None
 
                 try:
-                    # Get context from pool (optimized)
-                    context = await self.browser_manager.get_context()
+                    context = (
+                        await self.browser_manager.get_context()
+                    )
+
                     page = await context.new_page()
 
-                    # Optimized page loading with minimal wait
-                    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                    await page.goto(
+                        url,
+                        timeout=60000,
+                        wait_until="domcontentloaded",
+                    )
 
-                    # Wait for essential content only
+                    # Current Kleinanzeigen result-list selector.
+                    #
+                    # The previous implementation waited for
+                    # ".ad-listitem", which is no longer part of the
+                    # current Astro result-card markup.
                     try:
                         await page.wait_for_selector(
-                            ".ad-listitem", timeout=5000, state="visible"
+                            "#srchrslt-adtable "
+                            "article[data-adid]",
+                            timeout=5000,
+                            state="visible",
                         )
                     except Exception:
-                        # Continue even if selector not found - might be empty page
+                        # An empty result page is valid.
                         pass
 
-                    # Extract ads with optimized method
-                    results = await self.extract_ads_optimized(page)
+                    results = (
+                        await self.extract_ads_optimized(
+                            page
+                        )
+                    )
 
-                    # Extract any caller-requested selectors from the same page
+                    # Optional selectors requested by callers.
                     extras: Dict[str, str] = {}
+
                     if extra_selectors:
-                        for key, selector in extra_selectors.items():
+                        for key, selector in (
+                            extra_selectors.items()
+                        ):
                             try:
-                                el = await page.query_selector(selector)
-                                if el:
-                                    extras[key] = await el.inner_text()
+                                element = (
+                                    await page.query_selector(
+                                        selector
+                                    )
+                                )
+
+                                if element:
+                                    extras[key] = (
+                                        await element.inner_text()
+                                    )
+
                             except Exception:
                                 pass
 
-                    # Create successful metrics
                     metrics = PageMetrics(
                         page_number=page_num,
                         url=url,
@@ -379,12 +698,15 @@ class UltraOptimizedScraper:
                         results_count=len(results),
                     )
 
-                    return results, metrics, extras
+                    return (
+                        results,
+                        metrics,
+                        extras,
+                    )
 
-                except Exception as e:
-                    last_error = e
+                except Exception as exc:
+                    last_error = exc
 
-                    # Classify error for retry decision
                     error_context = ErrorContext(
                         operation="ultra_page_fetch",
                         page_number=page_num,
@@ -392,31 +714,50 @@ class UltraOptimizedScraper:
                         retry_attempt=attempt,
                     )
 
-                    structured_error = ErrorClassifier.classify_exception(
-                        e, error_context, "page_fetch"
+                    structured_error = (
+                        ErrorClassifier.classify_exception(
+                            exc,
+                            error_context,
+                            "page_fetch",
+                        )
                     )
 
-                    # Decide on retry
-                    if attempt < retry_count and structured_error.should_retry(
-                        retry_count
+                    if (
+                        attempt < retry_count
+                        and structured_error.should_retry(
+                            retry_count
+                        )
                     ):
-                        # Exponential backoff with jitter (optimized)
-                        wait_time = min((2**attempt) + random.uniform(0, 0.5), 5.0)
-                        await asyncio.sleep(wait_time)
+                        wait_time = min(
+                            (2 ** attempt)
+                            + random.uniform(0, 0.5),
+                            5.0,
+                        )
+
+                        await asyncio.sleep(
+                            wait_time
+                        )
+
                         continue
 
-                    # All retries exhausted
                     break
 
                 finally:
-                    # Cleanup resources immediately
                     if page:
                         await page.close()
-                    if context:
-                        await self.browser_manager.release_context(context)
 
-            # Create failed metrics
-            error_msg = str(last_error) if last_error else "Unknown error"
+                    if context:
+                        await (
+                            self.browser_manager
+                            .release_context(context)
+                        )
+
+            error_message = (
+                str(last_error)
+                if last_error
+                else "Unknown error"
+            )
+
             metrics = PageMetrics(
                 page_number=page_num,
                 url=url,
@@ -424,7 +765,7 @@ class UltraOptimizedScraper:
                 end_time=time.time(),
                 success=False,
                 retry_count=retry_count,
-                error_message=error_msg,
+                error_message=error_message,
                 results_count=0,
             )
 
@@ -441,163 +782,344 @@ class UltraOptimizedScraper:
         min_publish_date: datetime = None,
     ) -> Dict[str, Any]:
         """
-        Ultra-optimized multi-page scraping with all performance enhancements.
-
-        Expected performance improvements:
-        - 30-50% faster than standard optimized version
-        - Better memory efficiency
-        - More reliable under high load
+        Scrape one or more Kleinanzeigen search-result pages.
         """
-        logger = ErrorLogger("ultra_scraper")
+        logger = ErrorLogger(
+            "ultra_scraper"
+        )
+
         warning_manager = WarningManager()
+
         tracker = PerformanceTracker()
         tracker.start_request()
 
         with error_handling_context(
-            operation="ultra_multi_page_scrape", logger=logger
-        ) as ctx:
-            # Build URLs efficiently
-            base_url = "https://www.kleinanzeigen.de"
+            operation="ultra_multi_page_scrape",
+            logger=logger,
+        ) as context_info:
 
-            # Optimized URL building
+            base_url = (
+                "https://www.kleinanzeigen.de"
+            )
+
+            # --------------------------------------------------------------
+            # Price path
+            # --------------------------------------------------------------
+
             price_path = ""
-            if min_price is not None or max_price is not None:
-                min_str = str(min_price) if min_price is not None else ""
-                max_str = str(max_price) if max_price is not None else ""
-                price_path = f"/preis:{min_str}:{max_str}"
 
-            search_path = f"{price_path}/s-seite:{{page}}"
+            if (
+                min_price is not None
+                or max_price is not None
+            ):
+                min_value = (
+                    str(min_price)
+                    if min_price is not None
+                    else ""
+                )
 
-            params = {}
+                max_value = (
+                    str(max_price)
+                    if max_price is not None
+                    else ""
+                )
+
+                price_path = (
+                    f"/preis:"
+                    f"{min_value}:"
+                    f"{max_value}"
+                )
+
+            # --------------------------------------------------------------
+            # Search URL
+            # --------------------------------------------------------------
+
+            search_path = (
+                f"{price_path}/s-seite:{{page}}"
+            )
+
+            params: Dict[str, Any] = {}
+
             if query:
                 params["keywords"] = query
+
             if location:
                 params["locationStr"] = location
+
             if radius:
                 params["radius"] = radius
 
-            param_string = f"?{urlencode(params)}" if params else ""
+            param_string = (
+                f"?{urlencode(params)}"
+                if params
+                else ""
+            )
+
             search_url = (
                 base_url
-                + search_path.format(price_path=price_path, page="{page}")
+                + search_path
                 + param_string
             )
 
-            # Create page fetch tasks
-            async def create_page_task(page_num: int):
-                url = search_url.format(page=page_num)
-                return await self.ultra_optimized_fetch_page(url, page_num)
+            # --------------------------------------------------------------
+            # Page task
+            # --------------------------------------------------------------
 
-            # Use memory-optimized batch processing
-            page_numbers = list(range(1, page_count + 1))
+            async def create_page_task(
+                page_num: int,
+            ):
+                page_url = search_url.format(
+                    page=page_num
+                )
 
-            # Process in optimal batches to balance speed and memory
-            batch_size = min(8, page_count)  # Optimal batch size based on testing
-            all_results = []
-            all_metrics = []
+                return await (
+                    self.ultra_optimized_fetch_page(
+                        page_url,
+                        page_num,
+                    )
+                )
+
+            page_numbers = list(
+                range(
+                    1,
+                    page_count + 1,
+                )
+            )
+
+            if page_count > 0:
+                batch_size = min(
+                    8,
+                    page_count,
+                )
+            else:
+                batch_size = 1
+
+            all_results: List[
+                Dict[str, Any]
+            ] = []
+
+            all_metrics: List[
+                PageMetrics
+            ] = []
+
             stop_early = False
 
-            for i in range(0, len(page_numbers), batch_size):
+            # --------------------------------------------------------------
+            # Process pages
+            # --------------------------------------------------------------
+
+            for index in range(
+                0,
+                len(page_numbers),
+                batch_size,
+            ):
                 if stop_early:
                     break
 
-                batch_pages = page_numbers[i : i + batch_size]
+                batch_pages = page_numbers[
+                    index:index + batch_size
+                ]
 
-                # Create tasks for this batch
-                batch_tasks = [create_page_task(page_num) for page_num in batch_pages]
+                batch_tasks = [
+                    create_page_task(page_num)
+                    for page_num in batch_pages
+                ]
 
-                # Execute batch with task manager
-                batch_results = await self.task_manager.gather_with_limit(
-                    batch_tasks, return_exceptions=True
+                batch_results = await (
+                    self.task_manager
+                    .gather_with_limit(
+                        batch_tasks,
+                        return_exceptions=True,
+                    )
                 )
 
-                # Process batch results
                 for result in batch_results:
-                    if isinstance(result, Exception):
+                    if isinstance(
+                        result,
+                        Exception,
+                    ):
                         logger.log_error(
                             ErrorClassifier.classify_exception(
                                 result,
-                                ErrorContext(operation="batch_processing"),
+                                ErrorContext(
+                                    operation=(
+                                        "batch_processing"
+                                    )
+                                ),
                                 "batch_execution",
                             )
                         )
+
                         continue
 
-                    page_results, page_metrics, _ = result
+                    (
+                        page_results,
+                        page_metrics,
+                        _,
+                    ) = result
 
-                    if min_publish_date and _page_has_old_listings(
-                        page_results, min_publish_date
-                    ):
-                        page_results = _filter_by_min_publish_date(
-                            page_results, min_publish_date
+                    if (
+                        min_publish_date
+                        and _page_has_old_listings(
+                            page_results,
+                            min_publish_date,
                         )
+                    ):
+                        page_results = (
+                            _filter_by_min_publish_date(
+                                page_results,
+                                min_publish_date,
+                            )
+                        )
+
                         stop_early = True
 
-                    all_results.extend(page_results)
-                    all_metrics.append(page_metrics)
-                    tracker.add_page_metric(page_metrics)
+                    all_results.extend(
+                        page_results
+                    )
 
-                # Memory cleanup between batches
+                    all_metrics.append(
+                        page_metrics
+                    )
+
+                    tracker.add_page_metric(
+                        page_metrics
+                    )
+
                 gc.collect()
 
-            # Set performance metrics
-            tracker.set_concurrent_level(batch_size)
-            browser_metrics = self.browser_manager.get_performance_metrics()
+            # --------------------------------------------------------------
+            # Metrics
+            # --------------------------------------------------------------
+
+            tracker.set_concurrent_level(
+                batch_size
+            )
+
+            browser_metrics = (
+                self.browser_manager
+                .get_performance_metrics()
+            )
+
             tracker.set_browser_contexts_used(
-                browser_metrics["contexts_in_use"] + browser_metrics["contexts_in_pool"]
+                browser_metrics[
+                    "contexts_in_use"
+                ]
+                + browser_metrics[
+                    "contexts_in_pool"
+                ]
             )
 
-            # Generate comprehensive metrics
-            request_metrics = tracker.get_request_metrics()
-            task_metrics = self.task_manager.get_metrics()
+            request_metrics = (
+                tracker.get_request_metrics()
+            )
 
-            # Calculate success statistics against actual pages attempted
-            pages_attempted = len(all_metrics)
-            successful_pages = sum(1 for m in all_metrics if m.success)
+            task_metrics = (
+                self.task_manager.get_metrics()
+            )
+
+            pages_attempted = len(
+                all_metrics
+            )
+
+            successful_pages = sum(
+                1
+                for metric in all_metrics
+                if metric.success
+            )
+
             success_rate = (
-                (successful_pages / pages_attempted) * 100 if pages_attempted > 0 else 0
+                (
+                    successful_pages
+                    / pages_attempted
+                )
+                * 100
+                if pages_attempted
+                else 0
             )
 
-            # Add performance-based warnings
+            # --------------------------------------------------------------
+            # Warnings
+            # --------------------------------------------------------------
+
             if success_rate < 90:
                 warning_manager.add_warning(
-                    f"Success rate below optimal: {success_rate:.1f}%",
+                    (
+                        "Success rate below optimal: "
+                        f"{success_rate:.1f}%"
+                    ),
                     ErrorSeverity.MEDIUM,
-                    ctx.context,
-                    affected_items=["pages_with_failures"],
-                    impact_description="Some data may be missing due to page failures",
+                    context_info.context,
+                    affected_items=[
+                        "pages_with_failures"
+                    ],
+                    impact_description=(
+                        "Some data may be missing "
+                        "due to page failures"
+                    ),
                 )
 
             if request_metrics.total_time > 8.0:
                 warning_manager.add_warning(
-                    f"Performance below target: {request_metrics.total_time:.1f}s for {page_count} pages",
+                    (
+                        "Performance below target: "
+                        f"{request_metrics.total_time:.1f}s "
+                        f"for {page_count} pages"
+                    ),
                     ErrorSeverity.LOW,
-                    ctx.context,
-                    impact_description="Consider reducing page count or checking network conditions",
+                    context_info.context,
+                    impact_description=(
+                        "Consider reducing page count "
+                        "or checking network conditions"
+                    ),
                 )
 
-            # Log comprehensive summary
+            # --------------------------------------------------------------
+            # Logging
+            # --------------------------------------------------------------
+
             logger.log_operation_summary(
-                operation=f"ultra_scrape_{page_count}_pages",
+                operation=(
+                    f"ultra_scrape_"
+                    f"{page_count}_pages"
+                ),
                 total_items=page_count,
                 successful_items=successful_pages,
-                warnings=warning_manager.get_warnings(),
+                warnings=(
+                    warning_manager.get_warnings()
+                ),
                 errors=[],
-                duration=request_metrics.total_time,
+                duration=(
+                    request_metrics.total_time
+                ),
             )
 
-            # Prepare ultra-comprehensive response
+            # --------------------------------------------------------------
+            # Response
+            # --------------------------------------------------------------
+
             response = {
                 "success": True,
                 "results": all_results,
-                "unique_results": len(all_results),
-                "time_taken": round(request_metrics.total_time, 3),
+                "unique_results": len(
+                    all_results
+                ),
+                "time_taken": round(
+                    request_metrics.total_time,
+                    3,
+                ),
                 "performance_metrics": {
                     **request_metrics.to_dict(),
-                    "success_rate": round(success_rate, 2),
+                    "success_rate": round(
+                        success_rate,
+                        2,
+                    ),
                     "optimization_level": "ultra",
                     "memory_optimized": True,
-                    "uvloop_enabled": hasattr(asyncio.get_event_loop(), "_selector"),
+                    "uvloop_enabled": hasattr(
+                        asyncio.get_event_loop(),
+                        "_selector",
+                    ),
                 },
                 "task_metrics": task_metrics,
                 "browser_metrics": browser_metrics,
@@ -608,33 +1130,45 @@ class UltraOptimizedScraper:
                     "intelligent_batching",
                     "context_pooling",
                     "automatic_gc",
+                    "current_kleinanzeigen_result_selector",
+                    "scoped_result_extraction",
+                    "json_ld_fallback",
                 ],
             }
 
-            # Add warning information if present
-            warnings = warning_manager.get_warnings()
+            warnings = (
+                warning_manager.get_warnings()
+            )
+
             if warnings:
-                response["warnings"] = warning_manager.get_user_friendly_messages()
-                response["warning_summary"] = warning_manager.get_warning_summary()
+                response["warnings"] = (
+                    warning_manager
+                    .get_user_friendly_messages()
+                )
+
+                response["warning_summary"] = (
+                    warning_manager
+                    .get_warning_summary()
+                )
 
             return response
 
     async def cleanup(self):
-        """Clean up all resources."""
+        """Release scraper resources."""
         await self.task_manager.cancel_all()
         await self.memory_processor.cleanup()
         gc.collect()
 
 
-# Factory function for easy integration
 async def create_ultra_optimized_scraper(
     browser_manager: OptimizedPlaywrightManager,
 ) -> UltraOptimizedScraper:
-    """Create and initialize an ultra-optimized scraper."""
-    return UltraOptimizedScraper(browser_manager)
+    """Create an ultra-optimized scraper instance."""
+    return UltraOptimizedScraper(
+        browser_manager
+    )
 
 
-# Convenience function for direct usage
 async def ultra_optimized_scrape_inserate(
     browser_manager: OptimizedPlaywrightManager,
     query: str = None,
@@ -646,26 +1180,26 @@ async def ultra_optimized_scrape_inserate(
     min_publish_date: datetime = None,
 ) -> Dict[str, Any]:
     """
-    Direct function for ultra-optimized scraping.
-
-    This function applies all advanced asyncio optimizations for maximum performance.
-    Expected improvements over standard version:
-    - 30-50% faster execution
-    - Better memory efficiency
-    - More reliable error handling
-    - Enhanced monitoring and metrics
+    Convenience wrapper for direct use.
     """
-    scraper = await create_ultra_optimized_scraper(browser_manager)
+    scraper = await (
+        create_ultra_optimized_scraper(
+            browser_manager
+        )
+    )
 
     try:
-        return await scraper.ultra_optimized_scrape(
-            query=query,
-            location=location,
-            radius=radius,
-            min_price=min_price,
-            max_price=max_price,
-            page_count=page_count,
-            min_publish_date=min_publish_date,
+        return await (
+            scraper.ultra_optimized_scrape(
+                query=query,
+                location=location,
+                radius=radius,
+                min_price=min_price,
+                max_price=max_price,
+                page_count=page_count,
+                min_publish_date=min_publish_date,
+            )
         )
+
     finally:
         await scraper.cleanup()
