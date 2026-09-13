@@ -9,6 +9,7 @@ Features:
 - Falls back to calculated page URLs (query-string safe) only when Kleinanzeigen
   exposes a total result count but no usable pagination link.
 - Supports explicit page_count or automatic pagination.
+- Supports category filtering via category_id / category_slug.
 - Maximum 50 pages.
 - Deduplicates listings by adid.
 - Stops on empty pages, repeated pagination URLs, publication-date limits,
@@ -22,7 +23,7 @@ import re
 import time
 from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, urljoin, quote
 
 from fastapi import HTTPException
 
@@ -220,6 +221,64 @@ def _extract_page_number(url: str) -> int:
             pass
 
     return 1
+
+
+def _build_category_search_url(
+    query: Optional[str],
+    location: Optional[str],
+    radius: Optional[int],
+    min_price: Optional[int],
+    max_price: Optional[int],
+    category_id: int,
+    category_slug: Optional[str],
+) -> str:
+    """
+    Build the initial (page 1) URL for a category-filtered search.
+
+    Kleinanzeigen requires the category (and, if present, the keyword) to be
+    part of the URL *path*, with a 'k0c{id}' filter segment carrying the
+    actual category id, e.g.:
+
+        /s-multimedia-elektronik/38106/liebherr/k0c161l2461r50
+
+    category_slug is optional and only improves the "prettiness" of the URL
+    (avoids a redirect); the k0c{id} filter segment is what Kleinanzeigen
+    actually uses to apply the category filter.
+    """
+    path_segments: List[str] = []
+
+    if category_slug:
+        path_segments.append(category_slug.strip("/"))
+
+    if query:
+        # Keyword becomes a path segment for category-filtered searches
+        # (matches Kleinanzeigen's own URL structure, e.g. .../liebherr/k0c...).
+        path_segments.append(quote(query.strip(), safe=""))
+
+    if min_price is not None or max_price is not None:
+        min_value = str(min_price) if min_price is not None else ""
+        max_value = str(max_price) if max_price is not None else ""
+        path_segments.append(f"preis:{min_value}:{max_value}")
+
+    # Filter segment carrying the actual category id. inject_page() (used
+    # for subsequent pages) recognizes this pattern (k?\d*c\d+) and inserts
+    # 'seite:N' right before it, so pagination keeps working automatically.
+    path_segments.append(f"k0c{category_id}")
+
+    url = BASE_URL + "/" + "/".join(path_segments)
+
+    params: Dict[str, Any] = {}
+
+    if location:
+        params["locationStr"] = location
+
+    if radius:
+        params["radius"] = radius
+
+    if params:
+        url += f"?{urlencode(params)}"
+
+    return url
 
 
 # ---------------------------------------------------------------------------
@@ -679,14 +738,11 @@ class UltraOptimizedScraper:
             # --------------------------------------------------------------
             # 3. Fallback using total result count
             #
-            # This protects against a frontend variation where the
-            # pagination links are not exposed to Playwright although the
-            # result counter clearly says that additional pages exist.
-            #
-            # inject_page() preserves the full query string (e.g.
-            # ?keywords=liebherr-51*), unlike a naive path-only rebuild —
-            # this matters for plain keyword searches where the search
-            # term lives exclusively in the query string.
+            # inject_page() preserves the full query string and correctly
+            # places 'seite:N' before any k?\d*c\d+ filter segment (which
+            # includes category-filtered URLs built by
+            # _build_category_search_url), so this works uniformly for
+            # keyword-only and category-filtered searches alike.
             # --------------------------------------------------------------
 
             if total_result_count:
@@ -762,7 +818,7 @@ class UltraOptimizedScraper:
                         wait_until="domcontentloaded",
                     )
 
-                    # Kleinanzeigen may redirect (e.g. plain keyword
+                    # Kleinanzeigen may redirect (e.g. category/keyword
                     # searches get canonicalized). Use the resolved URL
                     # for page-number extraction and next-page building
                     # so pagination stays consistent with what's on screen.
@@ -966,6 +1022,8 @@ class UltraOptimizedScraper:
         radius: int = None,
         min_price: int = None,
         max_price: int = None,
+        category_id: Optional[int] = None,
+        category_slug: Optional[str] = None,
         page_count: Optional[int] = None,
         min_publish_date: datetime = None,
     ) -> Dict[str, Any]:
@@ -1035,60 +1093,76 @@ class UltraOptimizedScraper:
             # Initial URL
             # --------------------------------------------------------------
 
-            price_path = ""
+            if category_id:
+                # Category-filtered search: builds a path-based URL with a
+                # k0c{id} filter segment (see _build_category_search_url).
+                current_page_url = _build_category_search_url(
+                    query=query,
+                    location=location,
+                    radius=radius,
+                    min_price=min_price,
+                    max_price=max_price,
+                    category_id=category_id,
+                    category_slug=category_slug,
+                )
 
-            if (
-                min_price is not None
-                or max_price is not None
-            ):
+            else:
+                # Existing keyword/location/price-only behaviour (unchanged).
+                price_path = ""
 
-                min_value = (
-                    str(min_price)
-                    if min_price is not None
+                if (
+                    min_price is not None
+                    or max_price is not None
+                ):
+
+                    min_value = (
+                        str(min_price)
+                        if min_price is not None
+                        else ""
+                    )
+
+                    max_value = (
+                        str(max_price)
+                        if max_price is not None
+                        else ""
+                    )
+
+                    price_path = (
+                        f"/preis:{min_value}:{max_value}"
+                    )
+
+                # Keep the initial URL compatible with the existing API.
+                # Kleinanzeigen will normally redirect this URL to its
+                # current canonical search-result URL. Pagination
+                # afterwards follows the actual href supplied by
+                # Kleinanzeigen.
+
+                search_path = (
+                    f"{price_path}/s-seite:1"
+                )
+
+                params: Dict[str, Any] = {}
+
+                if query:
+                    params["keywords"] = query
+
+                if location:
+                    params["locationStr"] = location
+
+                if radius:
+                    params["radius"] = radius
+
+                param_string = (
+                    f"?{urlencode(params)}"
+                    if params
                     else ""
                 )
 
-                max_value = (
-                    str(max_price)
-                    if max_price is not None
-                    else ""
+                current_page_url = (
+                    BASE_URL
+                    + search_path
+                    + param_string
                 )
-
-                price_path = (
-                    f"/preis:{min_value}:{max_value}"
-                )
-
-            # Keep the initial URL compatible with the existing API.
-            # Kleinanzeigen will normally redirect this URL to its current
-            # canonical search-result URL. Pagination afterwards follows
-            # the actual href supplied by Kleinanzeigen.
-
-            search_path = (
-                f"{price_path}/s-seite:1"
-            )
-
-            params: Dict[str, Any] = {}
-
-            if query:
-                params["keywords"] = query
-
-            if location:
-                params["locationStr"] = location
-
-            if radius:
-                params["radius"] = radius
-
-            param_string = (
-                f"?{urlencode(params)}"
-                if params
-                else ""
-            )
-
-            current_page_url = (
-                BASE_URL
-                + search_path
-                + param_string
-            )
 
             # --------------------------------------------------------------
             # State
@@ -1548,6 +1622,10 @@ class UltraOptimizedScraper:
                         stop_reason
                     ),
 
+                    "category_id": category_id,
+
+                    "category_slug": category_slug,
+
                     "uvloop_enabled": hasattr(
                         asyncio.get_event_loop(),
                         "_selector",
@@ -1577,6 +1655,7 @@ class UltraOptimizedScraper:
                     "current_kleinanzeigen_result_selector",
                     "dual_breadcrumb_selector_support",
                     "canonical_url_pagination",
+                    "category_filtering",
                     "scoped_result_extraction",
                     "json_ld_fallback",
                 ],
@@ -1634,6 +1713,8 @@ async def ultra_optimized_scrape_inserate(
     radius: int = None,
     min_price: int = None,
     max_price: int = None,
+    category_id: Optional[int] = None,
+    category_slug: Optional[str] = None,
     page_count: Optional[int] = None,
     min_publish_date: datetime = None,
 ) -> Dict[str, Any]:
@@ -1650,6 +1731,8 @@ async def ultra_optimized_scrape_inserate(
             radius=radius,
             min_price=min_price,
             max_price=max_price,
+            category_id=category_id,
+            category_slug=category_slug,
             page_count=page_count,
             min_publish_date=min_publish_date,
         )
