@@ -6,13 +6,12 @@ Reuses UltraOptimizedScraper for fetching/extraction; only the URL-building diff
 import asyncio
 import gc
 import logging
-import math
-import re
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 
 from utils.browser import OptimizedPlaywrightManager
 from utils.performance import PerformanceTracker
+from utils.pagination import inject_page, parse_breadcrumb
 from scrapers.inserate_ultra_optimized import (
     create_ultra_optimized_scraper,
     _page_has_old_listings,
@@ -20,67 +19,6 @@ from scrapers.inserate_ultra_optimized import (
 )
 
 _TOTAL_RESULTS_SELECTOR = {"breadcrump_summary": ".breadcrump-summary"}
-
-
-def inject_page(url: str, page_num: int) -> str:
-    """
-    Strip any existing seite/s-seite segment and inject the requested page number.
-
-    Category URLs: seite:N is inserted immediately before the filter segment
-    (the segment matching k?\\d*c\\d+), preserving any extra path components
-    (e.g. anzeige:angebote, preis::N) that appear before it:
-      /s-autos/anzeige:angebote/preis::15000/seite:2/c216+...
-    Generic search URLs (no filter segment): s-seite:N appended before the query string.
-    """
-    from urllib.parse import urlparse, urlunparse, unquote
-
-    parsed = urlparse(url)
-    path = unquote(parsed.path)
-
-    # Strip any existing page segment
-    segments = [
-        s
-        for s in path.strip("/").split("/")
-        if s and not re.match(r"^s-seite:\d+$", s) and not re.match(r"^seite:\d+$", s)
-    ]
-
-    if page_num > 1:
-        filter_idx = next(
-            (i for i, s in enumerate(segments) if re.match(r"^k?\d*c\d+", s)),
-            None,
-        )
-        if filter_idx is not None:
-            # Insert seite:N directly before the filter segment
-            segments.insert(filter_idx, f"seite:{page_num}")
-        else:
-            # Generic search: append s-seite:N before query string
-            segments.append(f"s-seite:{page_num}")
-
-    new_path = "/" + "/".join(segments)
-    return urlunparse(parsed._replace(path=new_path))
-
-
-def _parse_breadcrumb(breadcrump_text: str) -> Tuple[Optional[int], Optional[int]]:
-    """Parse the breadcrumb summary into (total_results, actual_page_count).
-
-    Kleinanzeigen renders e.g. 'Autos 1 - 25 von 48 Gebrauchtwagen...'
-    Page size is only unambiguous on page 1 (range always starts at 1), so
-    page_count is only computed then; otherwise returns None for page_count.
-    Returns (None, None) if the text cannot be parsed at all.
-    """
-    match = re.search(r"(\d[\d.]*)\s*-\s*(\d[\d.]*)\s+von\s+([\d.]+)", breadcrump_text)
-    if not match:
-        return None, None
-    page_start = int(match.group(1).replace(".", ""))
-    page_end = int(match.group(2).replace(".", ""))
-    total = int(match.group(3).replace(".", ""))
-    if page_start != 1:
-        # Can't derive page size from a partial last-page range
-        return total, None
-    page_size = page_end  # page_end - 1 + 1
-    if page_size <= 0:
-        return total, None
-    return total, math.ceil(total / page_size)
 
 
 async def scrape_by_url(
@@ -130,7 +68,7 @@ async def scrape_by_url(
                 page_results, page_metrics, extras = result
 
                 if total_results is None and "breadcrump_summary" in extras:
-                    total_results, actual_max_pages = _parse_breadcrumb(
+                    total_results, actual_max_pages = parse_breadcrumb(
                         extras["breadcrump_summary"]
                     )
                     effective = (
