@@ -13,7 +13,7 @@ async def get_inserate(
     radius: int = Query(None),
     min_price: int = Query(None),
     max_price: int = Query(None),
-    page_count: int = Query(1, ge=1, le=20),
+    page_count: int = Query(1, ge=1, le=50),
 ):
     """
     Enhanced inserate endpoint with comprehensive error handling and warnings.
@@ -31,9 +31,9 @@ async def get_inserate(
 
         try:
             # Validate input parameters
-            if page_count > 20:
+            if page_count > 50:
                 error_ctx.add_warning(
-                    f"Page count {page_count} exceeds recommended maximum of 20",
+                    f"Page count {page_count} exceeds recommended maximum of 50",
                     ErrorSeverity.MEDIUM,
                     impact_description="High page counts may result in slower response times",
                 )
