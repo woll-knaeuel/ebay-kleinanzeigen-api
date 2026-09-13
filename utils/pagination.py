@@ -28,15 +28,17 @@ def inject_page(url: str, page_num: int) -> str:
 
     Category URLs: seite:N is inserted immediately before the filter segment
     (the segment matching k?\\d*c\\d+), preserving any extra path components
-    (e.g. anzeige:angebote, preis::N) that appear before it.
-    Generic search URLs (no filter segment): s-seite:N is appended.
+    (e.g. anzeige:angebote, preis::N) that appear before it:
+      /s-autos/anzeige:angebote/preis::15000/seite:2/c216+...
+    Generic search URLs (no filter segment): s-seite:N appended before the query string.
 
-    Only the *path* is ever replaced — query string, params and fragment
+    Only the *path* is ever replaced — query string, params, and fragment
     from the original URL (e.g. ?keywords=...) are preserved untouched.
     """
     parsed = urlparse(url)
     path = unquote(parsed.path)
 
+    # Strip any existing page segment
     segments = [
         s
         for s in path.strip("/").split("/")
@@ -49,8 +51,10 @@ def inject_page(url: str, page_num: int) -> str:
             None,
         )
         if filter_idx is not None:
+            # Insert seite:N directly before the filter segment
             segments.insert(filter_idx, f"seite:{page_num}")
         else:
+            # Generic search: append s-seite:N before query string
             segments.append(f"s-seite:{page_num}")
 
     new_path = "/" + "/".join(segments)
@@ -61,8 +65,10 @@ def parse_breadcrumb(breadcrumb_text: str) -> Tuple[Optional[int], Optional[int]
     """Parse a breadcrumb summary into (total_results, actual_page_count).
 
     Kleinanzeigen renders e.g. 'Autos 1 - 25 von 48 Gebrauchtwagen...' or
-    '1 - 25 von 113 Ergebnissen für ...'. Page size is only unambiguous on
-    page 1 (range always starts at 1); otherwise page_count is None.
+    '1 - 25 von 113 Ergebnissen für „liebherr 51*" in Deutschland'.
+    Page size is only unambiguous on page 1 (range always starts at 1), so
+    page_count is only computed then; otherwise returns None for page_count.
+    Returns (None, None) if the text cannot be parsed at all.
     """
     match = re.search(r"(\d[\d.]*)\s*-\s*(\d[\d.]*)\s+von\s+([\d.]+)", breadcrumb_text)
     if not match:
@@ -71,15 +77,21 @@ def parse_breadcrumb(breadcrumb_text: str) -> Tuple[Optional[int], Optional[int]
     page_end = int(match.group(2).replace(".", ""))
     total = int(match.group(3).replace(".", ""))
     if page_start != 1:
+        # Can't derive page size from a partial last-page range
         return total, None
-    page_size = page_end
+    page_size = page_end  # page_end - 1 + 1
     if page_size <= 0:
         return total, None
     return total, math.ceil(total / page_size)
 
 
 async def get_total_result_count(page) -> Optional[int]:
-    """Read the total-result count, trying every known breadcrumb selector."""
+    """Read the total-result count from whichever breadcrumb selector matches.
+
+    Kleinanzeigen has used both '.breadcrump-summary' (class) and
+    '#srp-breadcrumb-summary' (id) markup; trying both keeps pagination
+    working regardless of which variant is currently live.
+    """
     for selector in BREADCRUMB_SELECTORS:
         try:
             element = await page.query_selector(selector)
