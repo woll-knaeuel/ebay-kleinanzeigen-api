@@ -235,20 +235,31 @@ def _build_category_search_url(
     """
     Build the initial (page 1) URL for a category-filtered search.
 
-    Kleinanzeigen requires the category (and, if present, the keyword) to be
-    part of the URL *path*, with a 'k0c{id}' filter segment carrying the
-    actual category id, e.g.:
+    Kleinanzeigen requires the URL to contain at least one path segment
+    starting with 's-' to be recognized as a search-results page. When a
+    category_slug is given (e.g. 's-multimedia-elektronik'), it naturally
+    provides this segment. When no slug is given, Kleinanzeigen still
+    renders a valid results page (correct breadcrumb / total count) but
+    silently fails to render the actual listing cards if that 's-' segment
+    is missing entirely — so a generic 's-seite:1' placeholder segment is
+    used as a fallback, mirroring the pattern already used for the
+    keyword-only (non-category) search path below.
 
-        /s-multimedia-elektronik/38106/liebherr/k0c161l2461r50
+    The 'k0c{id}' filter segment carries the actual category id, e.g.:
 
-    category_slug is optional and only improves the "prettiness" of the URL
-    (avoids a redirect); the k0c{id} filter segment is what Kleinanzeigen
-    actually uses to apply the category filter.
+        /s-multimedia-elektronik/38106/liebherr/k0c161l2461r50   (with slug)
+        /s-seite:1/liebherr/k0c161                                (without slug)
     """
     path_segments: List[str] = []
 
     if category_slug:
         path_segments.append(category_slug.strip("/"))
+    else:
+        # Mandatory 's-' prefixed segment — without it Kleinanzeigen loads
+        # a page with a valid breadcrumb/total count but renders no ad
+        # cards at all. inject_page() strips/reinserts this segment
+        # transparently on subsequent pages, same as the keyword-only path.
+        path_segments.append("s-seite:1")
 
     if query:
         # Keyword becomes a path segment for category-filtered searches
