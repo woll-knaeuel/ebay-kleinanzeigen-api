@@ -11,6 +11,11 @@ Important:
 - Price, description, location and publication date are extracted from the
   current result cards.
 - JSON-LD embedded in each card is used as a fallback.
+- Pages are fetched sequentially by default to avoid duplicate page content
+  caused by concurrent Kleinanzeigen requests.
+- page_count is an optional upper limit. If omitted, pagination continues
+  until no new results are found.
+- Results are deduplicated by adid.
 """
 
 import asyncio
@@ -40,6 +45,10 @@ from utils.asyncio_optimizations import (
     monitor_slow_coroutines,
 )
 
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 def _page_has_old_listings(
     results: list,
@@ -174,17 +183,60 @@ def _clean_location_text(text: str) -> str:
     return value.strip()
 
 
+def _deduplicate_results(
+    results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Deduplicate listings by adid.
+
+    Kleinanzeigen may return the same listing more than once when multiple
+    page requests overlap or when the site serves the same result page again.
+
+    The first occurrence is preserved because it corresponds to the earliest
+    page encountered by the scraper.
+    """
+    unique_results: List[Dict[str, Any]] = []
+    seen_adids = set()
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+
+        adid = result.get("adid")
+
+        if adid:
+            if adid in seen_adids:
+                continue
+
+            seen_adids.add(adid)
+
+        unique_results.append(result)
+
+    return unique_results
+
+
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
+
 class UltraOptimizedScraper:
     """
     Optimized scraper for Kleinanzeigen search result pages.
 
-    The most important difference to the old implementation is that result
-    extraction is restricted to:
+    The most important differences to the old implementation are:
 
-        #srchrslt-adtable
+    1. Result extraction is restricted to:
+           #srchrslt-adtable
 
-    This prevents additional listings from sections such as
-    "Weitere Ergebnisse in anderen Orten" from being returned.
+    2. Pagination is sequential by default.
+       This prevents Kleinanzeigen from returning identical result pages
+       when several page requests are issued concurrently.
+
+    3. page_count is optional.
+       If page_count is None, pagination continues until no new listings
+       are found.
+
+    4. Results are deduplicated by adid.
     """
 
     def __init__(
@@ -203,6 +255,10 @@ class UltraOptimizedScraper:
         )
 
         EventLoopOptimizer.setup_uvloop()
+
+    # ----------------------------------------------------------------------
+    # Result extraction
+    # ----------------------------------------------------------------------
 
     @monitor_slow_coroutines(threshold=0.5)
     async def extract_ads_optimized(
@@ -547,7 +603,10 @@ class UltraOptimizedScraper:
             # URL
             # --------------------------------------------------------------
 
-            if href.startswith("http://") or href.startswith("https://"):
+            if (
+                href.startswith("http://")
+                or href.startswith("https://")
+            ):
                 listing_url = href
             else:
                 listing_url = (
@@ -586,6 +645,10 @@ class UltraOptimizedScraper:
 
         except Exception:
             return ""
+
+    # ----------------------------------------------------------------------
+    # Fetch one page
+    # ----------------------------------------------------------------------
 
     @monitor_slow_coroutines(
         threshold=2.0,
@@ -645,10 +708,6 @@ class UltraOptimizedScraper:
                     )
 
                     # Current Kleinanzeigen result-list selector.
-                    #
-                    # The previous implementation waited for
-                    # ".ad-listitem", which is no longer part of the
-                    # current Astro result-card markup.
                     try:
                         await page.wait_for_selector(
                             "#srchrslt-adtable "
@@ -771,6 +830,10 @@ class UltraOptimizedScraper:
 
             return [], metrics, {}
 
+    # ----------------------------------------------------------------------
+    # Main scraper
+    # ----------------------------------------------------------------------
+
     async def ultra_optimized_scrape(
         self,
         query: str = None,
@@ -778,11 +841,34 @@ class UltraOptimizedScraper:
         radius: int = None,
         min_price: int = None,
         max_price: int = None,
-        page_count: int = 1,
+        page_count: Optional[int] = None,
         min_publish_date: datetime = None,
     ) -> Dict[str, Any]:
         """
-        Scrape one or more Kleinanzeigen search-result pages.
+        Scrape Kleinanzeigen search-result pages.
+
+        page_count:
+            Optional maximum number of pages.
+
+            None:
+                No explicit page limit. Pages are fetched sequentially until
+                Kleinanzeigen no longer provides new result IDs.
+
+            1, 2, 3, ...:
+                Explicit upper limit.
+
+        IMPORTANT:
+
+        The default is intentionally None rather than 1.
+
+        Kleinanzeigen can have substantially more than one result page.
+        With page_count omitted, this implementation therefore follows the
+        pagination automatically.
+
+        Pages are deliberately fetched sequentially. Concurrent requests to
+        Kleinanzeigen can return the same result page multiple times, which
+        produces large numbers of duplicates. Sequential pagination together
+        with adid-based deduplication avoids this.
         """
         logger = ErrorLogger(
             "ultra_scraper"
@@ -801,6 +887,28 @@ class UltraOptimizedScraper:
             base_url = (
                 "https://www.kleinanzeigen.de"
             )
+
+            # --------------------------------------------------------------
+            # Validate page_count
+            # --------------------------------------------------------------
+
+            if page_count is not None:
+                if page_count < 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "page_count must be >= 1 "
+                            "when specified"
+                        ),
+                    )
+
+                # Kleinanzeigen supports substantially more than 20 pages
+                # in the browser. The old API limit of 20 therefore must not
+                # be enforced here.
+                #
+                # An explicitly supplied value is treated only as an upper
+                # limit by the scraper.
+                page_count = int(page_count)
 
             # --------------------------------------------------------------
             # Price path
@@ -862,37 +970,8 @@ class UltraOptimizedScraper:
             )
 
             # --------------------------------------------------------------
-            # Page task
+            # Sequential page processing
             # --------------------------------------------------------------
-
-            async def create_page_task(
-                page_num: int,
-            ):
-                page_url = search_url.format(
-                    page=page_num
-                )
-
-                return await (
-                    self.ultra_optimized_fetch_page(
-                        page_url,
-                        page_num,
-                    )
-                )
-
-            page_numbers = list(
-                range(
-                    1,
-                    page_count + 1,
-                )
-            )
-
-            if page_count > 0:
-                batch_size = min(
-                    8,
-                    page_count,
-                )
-            else:
-                batch_size = 1
 
             all_results: List[
                 Dict[str, Any]
@@ -902,98 +981,253 @@ class UltraOptimizedScraper:
                 PageMetrics
             ] = []
 
-            stop_early = False
+            seen_adids = set()
 
-            # --------------------------------------------------------------
-            # Process pages
-            # --------------------------------------------------------------
+            page_num = 1
+            stop_reason = None
 
-            for index in range(
-                0,
-                len(page_numbers),
-                batch_size,
-            ):
-                if stop_early:
+            while True:
+
+                # ----------------------------------------------------------
+                # Explicit page limit
+                # ----------------------------------------------------------
+
+                if (
+                    page_count is not None
+                    and page_num > page_count
+                ):
+                    stop_reason = (
+                        "page_count_limit_reached"
+                    )
                     break
 
-                batch_pages = page_numbers[
-                    index:index + batch_size
-                ]
-
-                batch_tasks = [
-                    create_page_task(page_num)
-                    for page_num in batch_pages
-                ]
-
-                batch_results = await (
-                    self.task_manager
-                    .gather_with_limit(
-                        batch_tasks,
-                        return_exceptions=True,
-                    )
+                page_url = search_url.format(
+                    page=page_num
                 )
 
-                for result in batch_results:
-                    if isinstance(
-                        result,
-                        Exception,
-                    ):
-                        logger.log_error(
-                            ErrorClassifier.classify_exception(
-                                result,
-                                ErrorContext(
-                                    operation=(
-                                        "batch_processing"
-                                    )
-                                ),
-                                "batch_execution",
-                            )
-                        )
+                logger.logger.info(
+                    "[OVERVIEW] Sequential pagination: "
+                    f"fetching page {page_num}"
+                )
 
-                        continue
-
+                try:
                     (
                         page_results,
                         page_metrics,
                         _,
-                    ) = result
-
-                    if (
-                        min_publish_date
-                        and _page_has_old_listings(
-                            page_results,
-                            min_publish_date,
+                    ) = await (
+                        self.ultra_optimized_fetch_page(
+                            page_url,
+                            page_num,
                         )
+                    )
+
+                except Exception as exc:
+                    logger.log_error(
+                        ErrorClassifier.classify_exception(
+                            exc,
+                            ErrorContext(
+                                operation=(
+                                    "sequential_page_fetch"
+                                ),
+                                page_number=page_num,
+                                url=page_url,
+                            ),
+                            "page_execution",
+                        )
+                    )
+
+                    stop_reason = (
+                        "page_fetch_exception"
+                    )
+                    break
+
+                all_metrics.append(
+                    page_metrics
+                )
+
+                tracker.add_page_metric(
+                    page_metrics
+                )
+
+                # ----------------------------------------------------------
+                # Failed page
+                # ----------------------------------------------------------
+
+                if not page_metrics.success:
+                    logger.logger.warning(
+                        "[OVERVIEW] Page "
+                        f"{page_num} failed. "
+                        "Stopping sequential pagination."
+                    )
+
+                    stop_reason = (
+                        "page_fetch_failed"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # Empty page
+                # ----------------------------------------------------------
+
+                if not page_results:
+                    logger.logger.info(
+                        "[OVERVIEW] Page "
+                        f"{page_num} returned no results. "
+                        "Pagination finished."
+                    )
+
+                    stop_reason = (
+                        "empty_page"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # Deduplicate current page
+                # ----------------------------------------------------------
+
+                new_results = []
+
+                for result in page_results:
+                    if not isinstance(result, dict):
+                        continue
+
+                    adid = result.get("adid")
+
+                    # Listings without an adid are unusual. Retain them,
+                    # because removing them could silently lose valid data.
+                    if not adid:
+                        new_results.append(result)
+                        continue
+
+                    if adid in seen_adids:
+                        continue
+
+                    seen_adids.add(adid)
+                    new_results.append(result)
+
+                logger.logger.info(
+                    "[OVERVIEW] Page "
+                    f"{page_num}: "
+                    f"{len(page_results)} extracted, "
+                    f"{len(new_results)} new, "
+                    f"{len(page_results) - len(new_results)} duplicates"
+                )
+
+                # ----------------------------------------------------------
+                # Publication-date filtering
+                # ----------------------------------------------------------
+
+                if min_publish_date:
+                    if _page_has_old_listings(
+                        page_results,
+                        min_publish_date,
                     ):
-                        page_results = (
+                        new_results = (
                             _filter_by_min_publish_date(
-                                page_results,
+                                new_results,
                                 min_publish_date,
                             )
                         )
 
-                        stop_early = True
+                        # Kleinanzeigen results are normally ordered newest
+                        # first. Once an older listing occurs, subsequent
+                        # pages are no longer needed for a date-bounded
+                        # search.
+                        stop_reason = (
+                            "min_publish_date_reached"
+                        )
 
-                    all_results.extend(
-                        page_results
+                # ----------------------------------------------------------
+                # Add results
+                # ----------------------------------------------------------
+
+                all_results.extend(
+                    new_results
+                )
+
+                # ----------------------------------------------------------
+                # Stop when a page contains no new ads
+                # ----------------------------------------------------------
+
+                if not new_results:
+                    logger.logger.info(
+                        "[OVERVIEW] Page "
+                        f"{page_num} contained no new listings. "
+                        "Pagination finished."
                     )
 
-                    all_metrics.append(
-                        page_metrics
-                    )
+                    if stop_reason is None:
+                        stop_reason = (
+                            "no_new_results"
+                        )
 
-                    tracker.add_page_metric(
-                        page_metrics
-                    )
+                    break
 
-                gc.collect()
+                # ----------------------------------------------------------
+                # If min_publish_date caused an early stop
+                # ----------------------------------------------------------
+
+                if (
+                    stop_reason
+                    == "min_publish_date_reached"
+                ):
+                    break
+
+                # ----------------------------------------------------------
+                # Prepare next page
+                # ----------------------------------------------------------
+
+                page_num += 1
+
+                # Avoid unnecessarily retaining browser-side objects and
+                # encourage cleanup during long searches.
+                if page_num % 5 == 0:
+                    gc.collect()
+
+                # Small randomized delay between pages.
+
+                # This is intentionally short. The purpose is not to make
+                # scraping slow, but to avoid hammering the same endpoint
+                # with a burst of requests.
+                await asyncio.sleep(
+                    random.uniform(0.15, 0.35)
+                )
+
+            # --------------------------------------------------------------
+            # Final global deduplication
+            # --------------------------------------------------------------
+
+            all_results = _deduplicate_results(
+                all_results
+            )
 
             # --------------------------------------------------------------
             # Metrics
             # --------------------------------------------------------------
 
+            pages_attempted = len(
+                all_metrics
+            )
+
+            successful_pages = sum(
+                1
+                for metric in all_metrics
+                if metric.success
+            )
+
+            success_rate = (
+                (
+                    successful_pages
+                    / pages_attempted
+                )
+                * 100
+                if pages_attempted
+                else 0
+            )
+
             tracker.set_concurrent_level(
-                batch_size
+                1
             )
 
             browser_metrics = (
@@ -1018,26 +1252,6 @@ class UltraOptimizedScraper:
                 self.task_manager.get_metrics()
             )
 
-            pages_attempted = len(
-                all_metrics
-            )
-
-            successful_pages = sum(
-                1
-                for metric in all_metrics
-                if metric.success
-            )
-
-            success_rate = (
-                (
-                    successful_pages
-                    / pages_attempted
-                )
-                * 100
-                if pages_attempted
-                else 0
-            )
-
             # --------------------------------------------------------------
             # Warnings
             # --------------------------------------------------------------
@@ -1059,18 +1273,21 @@ class UltraOptimizedScraper:
                     ),
                 )
 
-            if request_metrics.total_time > 8.0:
+            if (
+                request_metrics.total_time > 8.0
+                and pages_attempted > 1
+            ):
                 warning_manager.add_warning(
                     (
                         "Performance below target: "
                         f"{request_metrics.total_time:.1f}s "
-                        f"for {page_count} pages"
+                        f"for {pages_attempted} pages"
                     ),
                     ErrorSeverity.LOW,
                     context_info.context,
                     impact_description=(
-                        "Consider reducing page count "
-                        "or checking network conditions"
+                        "Sequential pagination is used "
+                        "to avoid duplicate result pages"
                     ),
                 )
 
@@ -1081,9 +1298,11 @@ class UltraOptimizedScraper:
             logger.log_operation_summary(
                 operation=(
                     f"ultra_scrape_"
-                    f"{page_count}_pages"
+                    f"{pages_attempted}_pages"
                 ),
-                total_items=page_count,
+                total_items=len(
+                    all_results
+                ),
                 successful_items=successful_pages,
                 warnings=(
                     warning_manager.get_warnings()
@@ -1110,12 +1329,21 @@ class UltraOptimizedScraper:
                 ),
                 "performance_metrics": {
                     **request_metrics.to_dict(),
+                    "pages_requested": pages_attempted,
+                    "pages_successful": successful_pages,
                     "success_rate": round(
                         success_rate,
                         2,
                     ),
                     "optimization_level": "ultra",
                     "memory_optimized": True,
+                    "pagination_mode": (
+                        "unlimited_until_exhausted"
+                        if page_count is None
+                        else "explicit_limit"
+                    ),
+                    "page_limit": page_count,
+                    "stop_reason": stop_reason,
                     "uvloop_enabled": hasattr(
                         asyncio.get_event_loop(),
                         "_selector",
@@ -1127,7 +1355,10 @@ class UltraOptimizedScraper:
                     "uvloop_integration",
                     "memory_conscious_processing",
                     "advanced_task_management",
-                    "intelligent_batching",
+                    "sequential_pagination",
+                    "automatic_pagination",
+                    "adid_deduplication",
+                    "intelligent_page_stop",
                     "context_pooling",
                     "automatic_gc",
                     "current_kleinanzeigen_result_selector",
@@ -1153,12 +1384,20 @@ class UltraOptimizedScraper:
 
             return response
 
+    # ----------------------------------------------------------------------
+    # Cleanup
+    # ----------------------------------------------------------------------
+
     async def cleanup(self):
         """Release scraper resources."""
         await self.task_manager.cancel_all()
         await self.memory_processor.cleanup()
         gc.collect()
 
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
 async def create_ultra_optimized_scraper(
     browser_manager: OptimizedPlaywrightManager,
@@ -1169,6 +1408,10 @@ async def create_ultra_optimized_scraper(
     )
 
 
+# ---------------------------------------------------------------------------
+# Public convenience wrapper
+# ---------------------------------------------------------------------------
+
 async def ultra_optimized_scrape_inserate(
     browser_manager: OptimizedPlaywrightManager,
     query: str = None,
@@ -1176,11 +1419,17 @@ async def ultra_optimized_scrape_inserate(
     radius: int = None,
     min_price: int = None,
     max_price: int = None,
-    page_count: int = 1,
+    page_count: Optional[int] = None,
     min_publish_date: datetime = None,
 ) -> Dict[str, Any]:
     """
     Convenience wrapper for direct use.
+
+    page_count=None means:
+        Follow Kleinanzeigen pagination until no new results are found.
+
+    page_count=N means:
+        Fetch at most N pages.
     """
     scraper = await (
         create_ultra_optimized_scraper(
