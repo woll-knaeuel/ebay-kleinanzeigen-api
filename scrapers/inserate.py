@@ -7,6 +7,8 @@ from urllib.parse import urlencode, urljoin
 
 from fastapi import HTTPException
 
+# vorher: eigene inject_page()/_parse_breadcrumb()-Definitionen
+from utils.pagination import inject_page, parse_breadcrumb as _parse_breadcrumb
 from utils.browser import PlaywrightManager, OptimizedPlaywrightManager
 from utils.performance import PageMetrics, track_page_performance
 from utils.error_handling import (
