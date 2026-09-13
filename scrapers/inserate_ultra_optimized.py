@@ -1169,3 +1169,491 @@ class UltraOptimizedScraper:
                                 operation="sequential_page_fetch",
                                 page_number=page_num,
                                 url=current_page_url,
+                            ),
+                            "page_execution",
+                        )
+                    )
+
+                    stop_reason = (
+                        "page_fetch_exception"
+                    )
+                    break
+
+                all_metrics.append(
+                    page_metrics
+                )
+
+                tracker.add_page_metric(
+                    page_metrics
+                )
+
+                # ----------------------------------------------------------
+                # Update total-result information
+                # ----------------------------------------------------------
+
+                if page_extras.get("total_result_count") is not None:
+
+                    discovered_total_result_count = (
+                        page_extras["total_result_count"]
+                    )
+
+                    discovered_total_pages = (
+                        (
+                            discovered_total_result_count
+                            + RESULTS_PER_PAGE
+                            - 1
+                        )
+                        // RESULTS_PER_PAGE
+                    )
+
+                # ----------------------------------------------------------
+                # Failed page
+                # ----------------------------------------------------------
+
+                if not page_metrics.success:
+
+                    logger.logger.warning(
+                        f"[OVERVIEW] Page {page_num} failed."
+                    )
+
+                    stop_reason = (
+                        "page_fetch_failed"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # Empty page
+                # ----------------------------------------------------------
+
+                if not page_results:
+
+                    logger.logger.info(
+                        f"[OVERVIEW] Page {page_num} returned "
+                        "no results."
+                    )
+
+                    stop_reason = (
+                        "empty_page"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # Deduplication
+                # ----------------------------------------------------------
+
+                new_results = []
+
+                for result in page_results:
+
+                    if not isinstance(result, dict):
+                        continue
+
+                    adid = result.get("adid")
+
+                    if not adid:
+                        new_results.append(result)
+                        continue
+
+                    if adid in seen_adids:
+                        continue
+
+                    seen_adids.add(adid)
+
+                    new_results.append(result)
+
+                duplicate_count = (
+                    len(page_results)
+                    - len(new_results)
+                )
+
+                logger.logger.info(
+                    f"[OVERVIEW] Page {page_num}: "
+                    f"{len(page_results)} extracted, "
+                    f"{len(new_results)} new, "
+                    f"{duplicate_count} duplicates"
+                )
+
+                # ----------------------------------------------------------
+                # Publication date
+                # ----------------------------------------------------------
+
+                reached_min_publish_date = False
+
+                if min_publish_date:
+
+                    if _page_has_old_listings(
+                        page_results,
+                        min_publish_date,
+                    ):
+
+                        new_results = (
+                            _filter_by_min_publish_date(
+                                new_results,
+                                min_publish_date,
+                            )
+                        )
+
+                        reached_min_publish_date = True
+
+                # ----------------------------------------------------------
+                # Add results
+                # ----------------------------------------------------------
+
+                all_results.extend(
+                    new_results
+                )
+
+                # ----------------------------------------------------------
+                # No new results
+                # ----------------------------------------------------------
+
+                if not new_results:
+
+                    stop_reason = (
+                        "no_new_results"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # Publication-date stop
+                # ----------------------------------------------------------
+
+                if reached_min_publish_date:
+
+                    stop_reason = (
+                        "min_publish_date_reached"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # Pagination exhausted
+                # ----------------------------------------------------------
+
+                if not next_page_url:
+
+                    logger.logger.info(
+                        f"[OVERVIEW] Page {page_num} has no "
+                        "next page."
+                    )
+
+                    stop_reason = (
+                        "no_next_page"
+                    )
+                    break
+
+                # ----------------------------------------------------------
+                # If total result count says we are already at the last
+                # page, do not make another request.
+                # ----------------------------------------------------------
+
+                if discovered_total_pages is not None:
+
+                    if page_num >= discovered_total_pages:
+
+                        stop_reason = (
+                            "total_result_count_exhausted"
+                        )
+                        break
+
+                # ----------------------------------------------------------
+                # Continue
+                # ----------------------------------------------------------
+
+                current_page_url = next_page_url
+                page_num += 1
+
+                if page_num % 5 == 0:
+                    gc.collect()
+
+                await asyncio.sleep(
+                    random.uniform(
+                        0.15,
+                        0.35,
+                    )
+                )
+
+            # --------------------------------------------------------------
+            # Final deduplication
+            # --------------------------------------------------------------
+
+            all_results = _deduplicate_results(
+                all_results
+            )
+
+            # --------------------------------------------------------------
+            # Metrics
+            # --------------------------------------------------------------
+
+            pages_attempted = len(
+                all_metrics
+            )
+
+            successful_pages = sum(
+                1
+                for metric in all_metrics
+                if metric.success
+            )
+
+            success_rate = (
+                (
+                    successful_pages
+                    / pages_attempted
+                )
+                * 100
+                if pages_attempted
+                else 0
+            )
+
+            tracker.set_concurrent_level(1)
+
+            browser_metrics = (
+                self.browser_manager
+                .get_performance_metrics()
+            )
+
+            tracker.set_browser_contexts_used(
+                browser_metrics["contexts_in_use"]
+                + browser_metrics["contexts_in_pool"]
+            )
+
+            request_metrics = (
+                tracker.get_request_metrics()
+            )
+
+            task_metrics = (
+                self.task_manager.get_metrics()
+            )
+
+            # --------------------------------------------------------------
+            # Warnings
+            # --------------------------------------------------------------
+
+            if success_rate < 90:
+
+                warning_manager.add_warning(
+                    (
+                        "Success rate below optimal: "
+                        f"{success_rate:.1f}%"
+                    ),
+                    ErrorSeverity.MEDIUM,
+                    context_info.context,
+                    affected_items=[
+                        "pages_with_failures"
+                    ],
+                    impact_description=(
+                        "Some data may be missing."
+                    ),
+                )
+
+            if (
+                request_metrics.total_time > 8.0
+                and pages_attempted > 1
+            ):
+
+                warning_manager.add_warning(
+                    (
+                        "Performance below target: "
+                        f"{request_metrics.total_time:.1f}s "
+                        f"for {pages_attempted} pages"
+                    ),
+                    ErrorSeverity.LOW,
+                    context_info.context,
+                    impact_description=(
+                        "Sequential pagination is used to ensure "
+                        "complete result retrieval."
+                    ),
+                )
+
+            # --------------------------------------------------------------
+            # Logging
+            # --------------------------------------------------------------
+
+            logger.log_operation_summary(
+                operation=(
+                    f"ultra_scrape_"
+                    f"{pages_attempted}_pages"
+                ),
+                total_items=len(all_results),
+                successful_items=successful_pages,
+                warnings=warning_manager.get_warnings(),
+                errors=[],
+                duration=request_metrics.total_time,
+            )
+
+            # --------------------------------------------------------------
+            # Response
+            # --------------------------------------------------------------
+
+            response = {
+                "success": True,
+
+                "results": all_results,
+
+                "unique_results": len(
+                    all_results
+                ),
+
+                "time_taken": round(
+                    request_metrics.total_time,
+                    3,
+                ),
+
+                "total_result_count": (
+                    discovered_total_result_count
+                ),
+
+                "total_pages": (
+                    discovered_total_pages
+                ),
+
+                "performance_metrics": {
+                    **request_metrics.to_dict(),
+
+                    "pages_requested": (
+                        pages_attempted
+                    ),
+
+                    "pages_successful": (
+                        successful_pages
+                    ),
+
+                    "success_rate": round(
+                        success_rate,
+                        2,
+                    ),
+
+                    "optimization_level": "ultra",
+
+                    "memory_optimized": True,
+
+                    "pagination_mode": (
+                        "automatic_until_exhausted"
+                        if requested_page_count is None
+                        else "explicit_limit"
+                    ),
+
+                    "page_limit": (
+                        effective_page_count
+                    ),
+
+                    "requested_page_count": (
+                        requested_page_count
+                    ),
+
+                    "automatic_page_limit": (
+                        MAX_AUTOMATIC_PAGES
+                    ),
+
+                    "stop_reason": (
+                        stop_reason
+                    ),
+
+                    "uvloop_enabled": hasattr(
+                        asyncio.get_event_loop(),
+                        "_selector",
+                    ),
+                },
+
+                "task_metrics": task_metrics,
+
+                "browser_metrics": browser_metrics,
+
+                "optimization_features": [
+                    "uvloop_integration",
+                    "memory_conscious_processing",
+                    "advanced_task_management",
+                    "sequential_pagination",
+                    "automatic_pagination",
+                    "real_next_page_href",
+                    "numbered_pagination_fallback",
+                    "total_result_count_detection",
+                    "total_pages_detection",
+                    "pagination_count_fallback_query_safe",
+                    "pagination_loop_protection",
+                    "adid_deduplication",
+                    "intelligent_page_stop",
+                    "context_pooling",
+                    "automatic_gc",
+                    "current_kleinanzeigen_result_selector",
+                    "dual_breadcrumb_selector_support",
+                    "canonical_url_pagination",
+                    "scoped_result_extraction",
+                    "json_ld_fallback",
+                ],
+            }
+
+            warnings = (
+                warning_manager.get_warnings()
+            )
+
+            if warnings:
+
+                response["warnings"] = (
+                    warning_manager
+                    .get_user_friendly_messages()
+                )
+
+                response["warning_summary"] = (
+                    warning_manager
+                    .get_warning_summary()
+                )
+
+            return response
+
+    # ----------------------------------------------------------------------
+    # Cleanup
+    # ----------------------------------------------------------------------
+
+    async def cleanup(self):
+        await self.task_manager.cancel_all()
+        await self.memory_processor.cleanup()
+        gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+async def create_ultra_optimized_scraper(
+    browser_manager: OptimizedPlaywrightManager,
+) -> UltraOptimizedScraper:
+
+    return UltraOptimizedScraper(
+        browser_manager
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public wrapper
+# ---------------------------------------------------------------------------
+
+async def ultra_optimized_scrape_inserate(
+    browser_manager: OptimizedPlaywrightManager,
+    query: str = None,
+    location: str = None,
+    radius: int = None,
+    min_price: int = None,
+    max_price: int = None,
+    page_count: Optional[int] = None,
+    min_publish_date: datetime = None,
+) -> Dict[str, Any]:
+
+    scraper = await create_ultra_optimized_scraper(
+        browser_manager
+    )
+
+    try:
+
+        return await scraper.ultra_optimized_scrape(
+            query=query,
+            location=location,
+            radius=radius,
+            min_price=min_price,
+            max_price=max_price,
+            page_count=page_count,
+            min_publish_date=min_publish_date,
+        )
+
+    finally:
+
+        await scraper.cleanup()
