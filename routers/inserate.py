@@ -13,7 +13,7 @@ async def get_inserate(
     radius: int = Query(None),
     min_price: int = Query(None),
     max_price: int = Query(None),
-    page_count: int = Query(1, ge=1, le=50),
+    page_count: int = Query(None, ge=1),
 ):
     """
     Enhanced inserate endpoint with comprehensive error handling and warnings.
