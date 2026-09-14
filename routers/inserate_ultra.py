@@ -144,6 +144,7 @@ async def get_inserate_ultra_optimized(
                 "average_page_time": metrics.get("average_page_time", 0),
                 "category_id": metrics.get("category_id"),
                 "category_slug": metrics.get("category_slug"),
+                "stop_reason": metrics.get("stop_reason"),
             }
             result["performance_metrics"] = essential_metrics
 
