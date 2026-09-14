@@ -1,22 +1,32 @@
 """
 Ultra-optimized Kleinanzeigen search-result scraper.
 
-WICHTIGE KORREKTUREN GEGENÜBER DER VORHERIGEN VERSION:
+WICHTIG:
 
-- Ein BrowserContext wird für die komplette Pagination-Session verwendet.
-- Eine Playwright-Page wird grundsätzlich für die komplette Session
-  wiederverwendet.
-- Context/Session wird NICHT zwischen einzelnen Seiten freigegeben.
-- ERR_TOO_MANY_REDIRECTS wird gezielt behandelt und recovered.
-- Bei einem einzelnen fehlgeschlagenen Seitenaufruf wird die bereits
-  gesammelte Ausgabe NICHT verworfen.
-- Fehlerdetails werden vollständig in failed_pages/page_details ausgegeben.
-- Die Seiten-Pagination folgt weiterhin den echten Kleinanzeigen-Links.
-- Fallback über total_result_count bleibt erhalten.
-- adid-Deduplizierung bleibt erhalten.
-- Content-Filter erfolgt weiterhin außerhalb dieses Scrapers.
-- total_result_count und total_pages beschreiben die Quelle,
-  pages_requested beschreibt dagegen tatsächlich angefragte Seiten.
+Ein BrowserContext wird für die komplette Pagination-Session
+wiederverwendet.
+
+Der Context darf NICHT zwischen einzelnen Seiten freigegeben werden,
+weil release_context() im BrowserManager standardmäßig Cookies löscht.
+
+Dadurch bleiben Cookies, Session-State und andere Browser-Zustände
+zwischen Seite 1, 2, 3, ... erhalten.
+
+Features:
+- Automatic pagination based on Kleinanzeigen's real pagination links.
+- Reads the total result count from the breadcrumb summary.
+- Uses the "Nächste" link whenever available.
+- Falls back to numbered pagination links.
+- Falls back to calculated page URLs.
+- Supports explicit page_count.
+- Supports category filtering.
+- Maximum 50 pages.
+- Deduplicates listings by adid.
+- Persistent BrowserContext for complete scrape session.
+- Retry handling with backoff.
+- Referer propagation between pagination pages.
+- Detailed page failure diagnostics.
+- Partial result return when a later page fails.
 """
 
 import asyncio
@@ -24,14 +34,43 @@ import gc
 import random
 import re
 import time
-from datetime import datetime, date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urljoin, quote
+
+from datetime import (
+    datetime,
+    date,
+    timedelta,
+)
+
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
+
+from urllib.parse import (
+    urlencode,
+    urljoin,
+    quote,
+)
 
 from fastapi import HTTPException
 
-from utils.browser import OptimizedPlaywrightManager
-from utils.performance import PageMetrics, PerformanceTracker
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+)
+
+from utils.browser import (
+    OptimizedPlaywrightManager,
+)
+
+from utils.performance import (
+    PageMetrics,
+    PerformanceTracker,
+)
+
 from utils.error_handling import (
     ErrorLogger,
     WarningManager,
@@ -40,46 +79,38 @@ from utils.error_handling import (
     ErrorContext,
     ErrorClassifier,
 )
+
 from utils.asyncio_optimizations import (
     HighPerformanceTaskManager,
     MemoryOptimizedProcessor,
     EventLoopOptimizer,
     monitor_slow_coroutines,
 )
+
 from utils.pagination import (
     inject_page as _inject_page,
     get_total_result_count as _shared_get_total_result_count,
 )
 
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 MAX_AUTOMATIC_PAGES = 50
 MAX_PAGE_LIMIT = 50
+
 RESULTS_PER_PAGE = 25
 
 BASE_URL = "https://www.kleinanzeigen.de"
 
-# Anzahl der Recovery-Versuche für Navigationen.
-#
-# retry_count=2 bedeutet:
-#   Versuch 1
-#   Versuch 2
-#   Versuch 3
-#
-# Die Retry-Logik gilt insbesondere für ERR_TOO_MANY_REDIRECTS.
-DEFAULT_RETRY_COUNT = 2
+PAGE_DELAY_MIN = 1.8
+PAGE_DELAY_MAX = 2.8
 
-# Zwischen normalen Seitenaufrufen.
-MIN_PAGE_DELAY = 1.5
-MAX_PAGE_DELAY = 2.5
+REDIRECT_RETRY_DELAY_MIN = 4.0
+REDIRECT_RETRY_DELAY_MAX = 7.0
 
-# Nach einem Redirect-Fehler etwas länger warten.
-REDIRECT_RECOVERY_MIN_DELAY = 3.0
-REDIRECT_RECOVERY_MAX_DELAY = 5.0
-
-# Timeout-Werte.
-NAVIGATION_TIMEOUT = 60_000
-RESULT_SELECTOR_TIMEOUT = 7_000
-SUMMARY_SELECTOR_TIMEOUT = 3_000
+NORMAL_RETRY_DELAY_MAX = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -90,16 +121,30 @@ def _page_has_old_listings(
     results: list,
     min_publish_date: datetime,
 ) -> bool:
+
     for result in results:
-        published = result.get("published_at")
+
+        published = result.get(
+            "published_at"
+        )
 
         if not published:
             continue
 
         try:
-            if datetime.fromisoformat(published) < min_publish_date:
+
+            if (
+                datetime.fromisoformat(
+                    published
+                )
+                < min_publish_date
+            ):
                 return True
-        except (TypeError, ValueError):
+
+        except (
+            TypeError,
+            ValueError,
+        ):
             continue
 
     return False
@@ -109,25 +154,52 @@ def _filter_by_min_publish_date(
     results: list,
     min_publish_date: datetime,
 ) -> list:
+
     filtered = []
 
     for result in results:
-        published = result.get("published_at")
+
+        published = result.get(
+            "published_at"
+        )
 
         if not published:
-            filtered.append(result)
+
+            filtered.append(
+                result
+            )
+
             continue
 
         try:
-            if datetime.fromisoformat(published) >= min_publish_date:
-                filtered.append(result)
-        except (TypeError, ValueError):
-            filtered.append(result)
+
+            if (
+                datetime.fromisoformat(
+                    published
+                )
+                >= min_publish_date
+            ):
+
+                filtered.append(
+                    result
+                )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            filtered.append(
+                result
+            )
 
     return filtered
 
 
-def _parse_kleinanzeigen_date(text: str) -> Optional[str]:
+def _parse_kleinanzeigen_date(
+    text: str,
+) -> Optional[str]:
+
     if not text:
         return None
 
@@ -137,11 +209,21 @@ def _parse_kleinanzeigen_date(text: str) -> Optional[str]:
         return None
 
     try:
+
         today = date.today()
 
         if text.startswith("Heute,"):
-            time_part = text.split(",", 1)[1].strip()
-            hour, minute = map(int, time_part.split(":"))
+
+            time_part = (
+                text
+                .split(",", 1)[1]
+                .strip()
+            )
+
+            hour, minute = map(
+                int,
+                time_part.split(":"),
+            )
 
             return datetime(
                 today.year,
@@ -152,10 +234,22 @@ def _parse_kleinanzeigen_date(text: str) -> Optional[str]:
             ).isoformat()
 
         if text.startswith("Gestern,"):
-            time_part = text.split(",", 1)[1].strip()
-            hour, minute = map(int, time_part.split(":"))
 
-            yesterday = today - timedelta(days=1)
+            time_part = (
+                text
+                .split(",", 1)[1]
+                .strip()
+            )
+
+            hour, minute = map(
+                int,
+                time_part.split(":"),
+            )
+
+            yesterday = (
+                today
+                - timedelta(days=1)
+            )
 
             return datetime(
                 yesterday.year,
@@ -165,7 +259,9 @@ def _parse_kleinanzeigen_date(text: str) -> Optional[str]:
                 minute,
             ).isoformat()
 
-        day, month, year = text.split(".")
+        day, month, year = (
+            text.split(".")
+        )
 
         return datetime(
             int(year),
@@ -174,14 +270,23 @@ def _parse_kleinanzeigen_date(text: str) -> Optional[str]:
         ).isoformat()
 
     except Exception:
+
         return None
 
 
-def _clean_location_text(text: str) -> str:
+def _clean_location_text(
+    text: str,
+) -> str:
+
     if not text:
         return ""
 
-    value = str(text).replace("\xa0", " ")
+    value = str(text)
+
+    value = value.replace(
+        "\xa0",
+        " ",
+    )
 
     lines = [
         line.strip()
@@ -190,11 +295,28 @@ def _clean_location_text(text: str) -> str:
     ]
 
     value = " ".join(lines)
-    value = " ".join(value.split())
 
-    for prefix in ("Ort", "Standort"):
-        if value.lower().startswith(prefix.lower()):
-            value = value[len(prefix):].strip(" :-|•")
+    value = " ".join(
+        value.split()
+    )
+
+    for prefix in (
+        "Ort",
+        "Standort",
+    ):
+
+        if value.lower().startswith(
+            prefix.lower()
+        ):
+
+            value = (
+                value[
+                    len(prefix):
+                ]
+                .strip(
+                    " :-|•"
+                )
+            )
 
     return value.strip()
 
@@ -202,97 +324,101 @@ def _clean_location_text(text: str) -> str:
 def _deduplicate_results(
     results: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    unique_results: List[Dict[str, Any]] = []
+
+    unique_results = []
+
     seen_adids = set()
 
     for result in results:
-        if not isinstance(result, dict):
+
+        if not isinstance(
+            result,
+            dict,
+        ):
             continue
 
-        adid = result.get("adid")
+        adid = result.get(
+            "adid"
+        )
 
         if adid:
+
             if adid in seen_adids:
                 continue
 
-            seen_adids.add(adid)
+            seen_adids.add(
+                adid
+            )
 
-        unique_results.append(result)
+        unique_results.append(
+            result
+        )
 
     return unique_results
 
 
-def _extract_page_number(url: str) -> int:
+def _extract_page_number(
+    url: str,
+) -> int:
+
     """
     Extract page number from URLs such as:
 
         /s-seite:1/...
         /s-seite:2/...
         /seite:2/...
-        /s-kueche-esszimmer/liebherr/seite:6/k0c86
     """
 
     if not url:
         return 1
 
     match = re.search(
-        r"/seite:(\d+)",
+        r"/s?-?seite:(\d+)",
         url,
         re.IGNORECASE,
     )
 
     if match:
+
         try:
-            return int(match.group(1))
+            return int(
+                match.group(1)
+            )
+
         except ValueError:
             pass
 
     return 1
 
 
-def _is_redirect_error(exc: Exception) -> bool:
-    """
-    Detect Playwright/Chromium redirect-loop errors.
-    """
+def _is_redirect_error(
+    exc: Exception,
+) -> bool:
 
-    message = str(exc).lower()
+    text = str(
+        exc
+    ).lower()
 
-    redirect_patterns = (
-        "err_too_many_redirects",
-        "too many redirects",
-        "redirect loop",
-        "redirects",
-    )
-
-    return any(
-        pattern in message
-        for pattern in redirect_patterns
+    return (
+        "err_too_many_redirects"
+        in text
+        or
+        "too many redirects"
+        in text
     )
 
 
-def _is_navigation_error(exc: Exception) -> bool:
-    """
-    Detect errors that are generally safe to retry.
-    """
+def _normalize_url(
+    url: Optional[str],
+) -> Optional[str]:
 
-    message = str(exc).lower()
+    if not url:
+        return None
 
-    retryable_patterns = (
-        "err_too_many_redirects",
-        "err_connection_reset",
-        "err_connection_closed",
-        "err_connection_aborted",
-        "err_timed_out",
-        "err_network_changed",
-        "timeout",
-        "navigation timeout",
-        "target closed",
-        "page crashed",
-    )
-
-    return any(
-        pattern in message
-        for pattern in retryable_patterns
+    return (
+        url
+        .split("#", 1)[0]
+        .rstrip("/")
     )
 
 
@@ -305,22 +431,23 @@ def _build_category_search_url(
     category_id: int,
     category_slug: Optional[str],
 ) -> str:
-    """
-    Build initial page-1 URL for category-filtered searches.
-    """
 
     path_segments: List[str] = []
 
     if category_slug:
+
         path_segments.append(
             category_slug.strip("/")
         )
+
     else:
+
         path_segments.append(
             "s-seite:1"
         )
 
     if query:
+
         path_segments.append(
             quote(
                 query.strip(),
@@ -328,7 +455,10 @@ def _build_category_search_url(
             )
         )
 
-    if min_price is not None or max_price is not None:
+    if (
+        min_price is not None
+        or max_price is not None
+    ):
 
         min_value = (
             str(min_price)
@@ -365,7 +495,11 @@ def _build_category_search_url(
         params["radius"] = radius
 
     if params:
-        url += f"?{urlencode(params)}"
+
+        url += (
+            "?"
+            + urlencode(params)
+        )
 
     return url
 
@@ -380,15 +514,30 @@ class UltraOptimizedScraper:
         self,
         browser_manager: OptimizedPlaywrightManager,
     ):
-        self.browser_manager = browser_manager
 
-        self.task_manager = HighPerformanceTaskManager(
-            max_concurrent=browser_manager._semaphore._value
+        self.browser_manager = (
+            browser_manager
         )
 
-        self.memory_processor = MemoryOptimizedProcessor(
-            max_concurrent=browser_manager._semaphore._value,
-            gc_threshold=50,
+        self.task_manager = (
+            HighPerformanceTaskManager(
+                max_concurrent=(
+                    browser_manager
+                    ._semaphore
+                    ._value
+                )
+            )
+        )
+
+        self.memory_processor = (
+            MemoryOptimizedProcessor(
+                max_concurrent=(
+                    browser_manager
+                    ._semaphore
+                    ._value
+                ),
+                gc_threshold=50,
+            )
         )
 
         EventLoopOptimizer.setup_uvloop()
@@ -397,7 +546,9 @@ class UltraOptimizedScraper:
     # Result extraction
     # ----------------------------------------------------------------------
 
-    @monitor_slow_coroutines(threshold=0.5)
+    @monitor_slow_coroutines(
+        threshold=0.5
+    )
     async def extract_ads_optimized(
         self,
         page,
@@ -411,11 +562,15 @@ class UltraOptimizedScraper:
                 "article[data-adid]"
             )
 
-            items = await page.query_selector_all(
-                selector
+            items = (
+                await page.query_selector_all(
+                    selector
+                )
             )
 
-            results: List[Dict[str, Any]] = []
+            results: List[
+                Dict[str, Any]
+            ] = []
 
             batch_size = 10
 
@@ -426,27 +581,40 @@ class UltraOptimizedScraper:
             ):
 
                 batch = items[
-                    index:index + batch_size
+                    index:
+                    index + batch_size
                 ]
 
                 tasks = [
-                    self._extract_single_ad(article)
+                    self._extract_single_ad(
+                        article
+                    )
                     for article in batch
                 ]
 
-                batch_results = await asyncio.gather(
-                    *tasks,
-                    return_exceptions=True,
+                batch_results = (
+                    await asyncio.gather(
+                        *tasks,
+                        return_exceptions=True,
+                    )
                 )
 
                 for result in batch_results:
 
-                    if isinstance(result, dict):
-                        results.append(result)
+                    if isinstance(
+                        result,
+                        dict,
+                    ):
 
-                if index % (
-                    batch_size * 5
-                ) == 0:
+                        results.append(
+                            result
+                        )
+
+                if (
+                    index
+                    % (batch_size * 5)
+                    == 0
+                ):
 
                     gc.collect()
 
@@ -462,7 +630,9 @@ class UltraOptimizedScraper:
     async def _extract_single_ad(
         self,
         article,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[
+        Dict[str, Any]
+    ]:
 
         try:
 
@@ -477,14 +647,18 @@ class UltraOptimizedScraper:
             if not adid or not href:
                 return None
 
-            title_task = self._get_text_content(
-                article,
-                "h3 a",
+            title_task = (
+                self._get_text_content(
+                    article,
+                    "h3 a",
+                )
             )
 
-            description_task = self._get_text_content(
-                article,
-                "h3 + p",
+            description_task = (
+                self._get_text_content(
+                    article,
+                    "h3 + p",
+                )
             )
 
             metadata_task = article.evaluate(
@@ -501,7 +675,6 @@ class UltraOptimizedScraper:
                     );
 
                     for (const span of spans) {
-
                         const text = (
                             span.innerText || ""
                         ).trim();
@@ -513,7 +686,6 @@ class UltraOptimizedScraper:
                     }
 
                     for (const span of spans) {
-
                         const text = (
                             span.innerText || ""
                         ).trim();
@@ -533,7 +705,6 @@ class UltraOptimizedScraper:
                     );
 
                     for (const paragraph of paragraphs) {
-
                         const text = (
                             paragraph.innerText || ""
                         ).trim();
@@ -592,7 +763,6 @@ class UltraOptimizedScraper:
                 ld_data = await article.evaluate(
                     """
                     (el) => {
-
                         const script = el.querySelector(
                             'script[type="application/ld+json"]'
                         );
@@ -602,7 +772,6 @@ class UltraOptimizedScraper:
                         }
 
                         try {
-
                             const data = JSON.parse(
                                 script.textContent || "{}"
                             );
@@ -619,7 +788,6 @@ class UltraOptimizedScraper:
                             };
 
                         } catch (error) {
-
                             return {};
                         }
                     }
@@ -638,9 +806,11 @@ class UltraOptimizedScraper:
 
             if not title_text.strip():
 
-                fallback_title = ld_data.get(
-                    "title",
-                    "",
+                fallback_title = (
+                    ld_data.get(
+                        "title",
+                        "",
+                    )
                 )
 
                 if isinstance(
@@ -654,9 +824,11 @@ class UltraOptimizedScraper:
 
             if not description_text.strip():
 
-                fallback_description = ld_data.get(
-                    "description",
-                    "",
+                fallback_description = (
+                    ld_data.get(
+                        "description",
+                        "",
+                    )
                 )
 
                 if isinstance(
@@ -681,6 +853,7 @@ class UltraOptimizedScraper:
                 price_text,
                 str,
             ):
+
                 price_text = ""
 
             price_text = (
@@ -708,13 +881,15 @@ class UltraOptimizedScraper:
                 "",
             )
 
-            location_text = _clean_location_text(
-                location_raw
-                if isinstance(
-                    location_raw,
-                    str,
+            location_text = (
+                _clean_location_text(
+                    location_raw
+                    if isinstance(
+                        location_raw,
+                        str,
+                    )
+                    else ""
                 )
-                else ""
             )
 
             # --------------------------------------------------------------
@@ -748,7 +923,9 @@ class UltraOptimizedScraper:
                 "title": title_text.strip(),
                 "price": price_text,
                 "location": location_text,
-                "description": description_text.strip(),
+                "description": (
+                    description_text.strip()
+                ),
                 "published_at": published_at,
             }
 
@@ -764,11 +941,14 @@ class UltraOptimizedScraper:
 
         try:
 
-            element = await parent_element.query_selector(
-                selector
+            element = (
+                await parent_element.query_selector(
+                    selector
+                )
             )
 
             if element:
+
                 return await element.inner_text()
 
             return ""
@@ -786,8 +966,10 @@ class UltraOptimizedScraper:
         page,
     ) -> Optional[int]:
 
-        return await _shared_get_total_result_count(
-            page
+        return (
+            await _shared_get_total_result_count(
+                page
+            )
         )
 
     # ----------------------------------------------------------------------
@@ -803,40 +985,55 @@ class UltraOptimizedScraper:
 
         try:
 
-            current_page = _extract_page_number(
-                current_url
+            current_page = (
+                _extract_page_number(
+                    current_url
+                )
             )
 
             # --------------------------------------------------------------
-            # 1. Explicit "Nächste"
+            # 1. Explicit "Nächste" link
             # --------------------------------------------------------------
 
             next_selectors = [
-                "#srchrslt-pagination "
-                "a[aria-label='Nächste'][href]",
-
-                "#srchrslt-pagination "
-                "a[title='Nächste'][href]",
-
-                "#pagination-container "
-                "a[aria-label='Nächste'][href]",
-
-                "#pagination-container "
-                "a[title='Nächste'][href]",
+                (
+                    "#srchrslt-pagination "
+                    "a[aria-label='Nächste'][href]"
+                ),
+                (
+                    "#srchrslt-pagination "
+                    "a[title='Nächste'][href]"
+                ),
+                (
+                    "#pagination-container "
+                    "a[aria-label='Nächste'][href]"
+                ),
+                (
+                    "#pagination-container "
+                    "a[title='Nächste'][href]"
+                ),
+                (
+                    ".pagination-next "
+                    "a[href]"
+                ),
             ]
 
             for selector in next_selectors:
 
                 try:
 
-                    links = await page.query_selector_all(
-                        selector
+                    links = (
+                        await page.query_selector_all(
+                            selector
+                        )
                     )
 
                     for link in links:
 
-                        href = await link.get_attribute(
-                            "href"
+                        href = (
+                            await link.get_attribute(
+                                "href"
+                            )
                         )
 
                         if not href:
@@ -854,9 +1051,18 @@ class UltraOptimizedScraper:
                         )
 
                         if (
-                            next_page > current_page
-                            and next_url != current_url
+                            next_page
+                            > current_page
+                            and
+                            _normalize_url(
+                                next_url
+                            )
+                            !=
+                            _normalize_url(
+                                current_url
+                            )
                         ):
+
                             return next_url
 
                 except Exception:
@@ -864,13 +1070,17 @@ class UltraOptimizedScraper:
                     continue
 
             # --------------------------------------------------------------
-            # 2. Numbered links
+            # 2. Numbered pagination links
             # --------------------------------------------------------------
 
             pagination_links = (
                 await page.query_selector_all(
-                    "#srchrslt-pagination a[href], "
-                    "#pagination-container a[href]"
+                    "#srchrslt-pagination "
+                    "a[href], "
+                    "#pagination-container "
+                    "a[href], "
+                    ".pagination-page "
+                    "a[href]"
                 )
             )
 
@@ -884,8 +1094,10 @@ class UltraOptimizedScraper:
 
                 try:
 
-                    href = await link.get_attribute(
-                        "href"
+                    href = (
+                        await link.get_attribute(
+                            "href"
+                        )
                     )
 
                     if not href:
@@ -896,7 +1108,15 @@ class UltraOptimizedScraper:
                         href,
                     )
 
-                    if next_url == current_url:
+                    if (
+                        _normalize_url(
+                            next_url
+                        )
+                        ==
+                        _normalize_url(
+                            current_url
+                        )
+                    ):
                         continue
 
                     candidate_page = (
@@ -905,13 +1125,27 @@ class UltraOptimizedScraper:
                         )
                     )
 
-                    if candidate_page <= current_page:
+                    if (
+                        candidate_page
+                        <= current_page
+                    ):
                         continue
 
-                    if next_url in seen_urls:
+                    normalized_candidate = (
+                        _normalize_url(
+                            next_url
+                        )
+                    )
+
+                    if (
+                        normalized_candidate
+                        in seen_urls
+                    ):
                         continue
 
-                    seen_urls.add(next_url)
+                    seen_urls.add(
+                        normalized_candidate
+                    )
 
                     candidates.append(
                         (
@@ -933,7 +1167,7 @@ class UltraOptimizedScraper:
                 return candidates[0][1]
 
             # --------------------------------------------------------------
-            # 3. total_result_count fallback
+            # 3. Result-count fallback
             # --------------------------------------------------------------
 
             if total_result_count:
@@ -948,7 +1182,10 @@ class UltraOptimizedScraper:
                     current_page + 1
                 )
 
-                if next_page <= total_pages:
+                if (
+                    next_page
+                    <= total_pages
+                ):
 
                     return _inject_page(
                         current_url,
@@ -962,191 +1199,38 @@ class UltraOptimizedScraper:
             return None
 
     # ----------------------------------------------------------------------
-    # Page preparation
-    # ----------------------------------------------------------------------
-
-    async def _prepare_page(
-        self,
-        page,
-    ):
-        """
-        Prepare a page before navigation/recovery.
-
-        We deliberately do NOT clear cookies here.
-        """
-
-        try:
-
-            await page.set_default_navigation_timeout(
-                NAVIGATION_TIMEOUT
-            )
-
-        except Exception:
-            pass
-
-        try:
-
-            await page.set_default_timeout(
-                30_000
-            )
-
-        except Exception:
-            pass
-
-    # ----------------------------------------------------------------------
-    # Navigate
-    # ----------------------------------------------------------------------
-
-    async def _navigate_with_recovery(
-        self,
-        context,
-        page,
-        url: str,
-        page_num: int,
-        retry_count: int = DEFAULT_RETRY_COUNT,
-    ):
-        """
-        Navigate to one result page.
-
-        Important:
-
-        The same BrowserContext is retained for the entire pagination
-        session.
-
-        On ERR_TOO_MANY_REDIRECTS we create a fresh Page in the SAME
-        context instead of throwing the complete session away.
-
-        Returns:
-
-            page,
-            canonical_url,
-            attempts
-        """
-
-        current_page = page
-        last_error = None
-
-        for attempt in range(
-            retry_count + 1
-        ):
-
-            try:
-
-                await self._prepare_page(
-                    current_page
-                )
-
-                # On recovery attempts use a slightly longer delay.
-                if attempt > 0:
-
-                    await asyncio.sleep(
-                        random.uniform(
-                            REDIRECT_RECOVERY_MIN_DELAY,
-                            REDIRECT_RECOVERY_MAX_DELAY,
-                        )
-                    )
-
-                # ----------------------------------------------------------
-                # Normal navigation
-                # ----------------------------------------------------------
-
-                await current_page.goto(
-                    url,
-                    timeout=NAVIGATION_TIMEOUT,
-                    wait_until="domcontentloaded",
-                )
-
-                canonical_url = (
-                    current_page.url
-                    or url
-                )
-
-                return (
-                    current_page,
-                    canonical_url,
-                    attempt,
-                    None,
-                )
-
-            except Exception as exc:
-
-                last_error = exc
-
-                # ----------------------------------------------------------
-                # Recovery for redirect/navigation errors
-                # ----------------------------------------------------------
-
-                if (
-                    attempt < retry_count
-                    and _is_navigation_error(exc)
-                ):
-
-                    # The old Page may have become stuck in a redirect
-                    # chain. Close ONLY the Page, not the Context.
-                    try:
-
-                        await current_page.close()
-
-                    except Exception:
-                        pass
-
-                    # Create a fresh page in the SAME context.
-                    #
-                    # This preserves the session cookies/local storage,
-                    # while eliminating any navigation state held by the
-                    # old Page.
-                    try:
-
-                        current_page = (
-                            await context.new_page()
-                        )
-
-                        await self._prepare_page(
-                            current_page
-                        )
-
-                    except Exception as page_exc:
-
-                        last_error = page_exc
-
-                        # If we cannot create a replacement Page there is
-                        # nothing useful left to retry.
-                        break
-
-                    continue
-
-                break
-
-        return (
-            current_page,
-            None,
-            retry_count,
-            last_error,
-        )
-
-    # ----------------------------------------------------------------------
-    # Fetch one page using an EXISTING context/page
+    # Fetch one page
     # ----------------------------------------------------------------------
 
     @monitor_slow_coroutines(
         threshold=2.0,
-        context_fn=lambda self, url, page_num, *args, **kwargs:
-            f"OVERVIEW page {page_num}: {url}",
+        context_fn=lambda
+        self,
+        context,
+        url,
+        page_num,
+        *args,
+        **kwargs:
+            (
+                f"OVERVIEW page "
+                f"{page_num}: {url}"
+            ),
     )
     async def ultra_optimized_fetch_page(
         self,
-        context,
-        page,
+        context: Optional[BrowserContext],
         url: str,
         page_num: int,
-        retry_count: int = DEFAULT_RETRY_COUNT,
-        extra_selectors: Dict[str, str] = None,
+        retry_count: int = 2,
+        extra_selectors: Optional[
+            Dict[str, str]
+        ] = None,
+        referer_url: Optional[str] = None,
     ) -> Tuple[
         List[Dict],
         PageMetrics,
         Dict[str, Any],
         Optional[str],
-        Any,
     ]:
 
         logger = ErrorLogger(
@@ -1154,270 +1238,526 @@ class UltraOptimizedScraper:
         )
 
         logger.logger.info(
-            f"[OVERVIEW] Fetching page {page_num}: {url}"
+            (
+                f"[OVERVIEW] Fetching page "
+                f"{page_num}: {url}"
+            )
         )
 
         start_time = time.time()
 
-        (
-            active_page,
-            canonical_url,
-            attempts_used,
-            navigation_error,
-        ) = await self._navigate_with_recovery(
-            context=context,
-            page=page,
-            url=url,
-            page_num=page_num,
-            retry_count=retry_count,
+        last_error = None
+
+        last_attempt = 0
+
+        last_canonical_url = None
+
+        last_navigation_error = None
+
+        last_navigation_status = None
+
+        # ------------------------------------------------------------------
+        # Backward compatibility:
+        #
+        # If no context is supplied, this method temporarily owns one.
+        #
+        # The main scraper ALWAYS supplies a persistent context.
+        # ------------------------------------------------------------------
+
+        owns_context = (
+            context is None
         )
 
-        # --------------------------------------------------------------
-        # Navigation failed
-        # --------------------------------------------------------------
+        if owns_context:
 
-        if navigation_error:
-
-            error_message = str(
-                navigation_error
+            context = (
+                await self.browser_manager.get_context()
             )
 
-            logger.logger.error(
-                "[OVERVIEW] Page "
-                f"{page_num} navigation failed: "
-                f"{error_message}"
-            )
+        assert context is not None
 
-            metrics = PageMetrics(
-                page_number=page_num,
-                url=url,
-                start_time=start_time,
-                end_time=time.time(),
-                success=False,
-                retry_count=attempts_used,
-                error_message=error_message,
-                results_count=0,
-            )
-
-            return (
-                [],
-                metrics,
-                {
-                    "navigation_error": error_message,
-                    "canonical_url": None,
-                    "current_page": page_num,
-                },
-                None,
-                active_page,
-            )
-
-        # --------------------------------------------------------------
-        # Page loaded
-        # --------------------------------------------------------------
-
-        try:
-
-            # ----------------------------------------------------------
-            # Wait for result cards.
-            # ----------------------------------------------------------
+        with error_handling_context(
+            operation="ultra_fetch_page",
+            page_number=page_num,
+            url=url,
+            logger=logger,
+        ):
 
             try:
 
-                await active_page.wait_for_selector(
-                    "#srchrslt-adtable "
-                    "article[data-adid]",
-                    timeout=RESULT_SELECTOR_TIMEOUT,
-                    state="visible",
-                )
+                for attempt in range(
+                    retry_count + 1
+                ):
 
-            except Exception:
+                    last_attempt = attempt
 
-                # Do not immediately consider this a hard failure.
-                # Kleinanzeigen may finish rendering asynchronously.
-                pass
+                    page: Optional[
+                        Page
+                    ] = None
 
-            # ----------------------------------------------------------
-            # Summary
-            # ----------------------------------------------------------
+                    navigation_error = None
 
-            try:
+                    navigation_status = None
 
-                await active_page.wait_for_selector(
-                    "#srp-breadcrumb-summary",
-                    timeout=SUMMARY_SELECTOR_TIMEOUT,
-                    state="attached",
-                )
-
-            except Exception:
-
-                pass
-
-            # ----------------------------------------------------------
-            # Extract
-            # ----------------------------------------------------------
-
-            results = (
-                await self.extract_ads_optimized(
-                    active_page
-                )
-            )
-
-            # ----------------------------------------------------------
-            # Total count
-            # ----------------------------------------------------------
-
-            total_result_count = (
-                await self._get_total_result_count(
-                    active_page
-                )
-            )
-
-            # ----------------------------------------------------------
-            # Next page
-            # ----------------------------------------------------------
-
-            next_page_url = (
-                await self._get_next_page_url(
-                    active_page,
-                    canonical_url,
-                    total_result_count,
-                )
-            )
-
-            extras: Dict[str, Any] = {}
-
-            if total_result_count is not None:
-
-                extras[
-                    "total_result_count"
-                ] = total_result_count
-
-                extras[
-                    "total_pages"
-                ] = (
-                    total_result_count
-                    + RESULTS_PER_PAGE
-                    - 1
-                ) // RESULTS_PER_PAGE
-
-            extras[
-                "current_page"
-            ] = _extract_page_number(
-                canonical_url
-            )
-
-            extras[
-                "canonical_url"
-            ] = canonical_url
-
-            extras[
-                "next_page_url"
-            ] = next_page_url
-
-            extras[
-                "attempts"
-            ] = attempts_used + 1
-
-            if extra_selectors:
-
-                for (
-                    key,
-                    selector,
-                ) in extra_selectors.items():
+                    canonical_url = None
 
                     try:
 
-                        element = (
-                            await active_page.query_selector(
-                                selector
+                        # --------------------------------------------------
+                        # NEW:
+                        #
+                        # Create only a PAGE.
+                        #
+                        # The BrowserContext stays alive for the entire
+                        # multi-page scrape.
+                        # --------------------------------------------------
+
+                        page = (
+                            await context.new_page()
+                        )
+
+                        # --------------------------------------------------
+                        # Navigation
+                        # --------------------------------------------------
+
+                        goto_kwargs = {
+                            "timeout": 60000,
+                            "wait_until": (
+                                "domcontentloaded"
+                            ),
+                        }
+
+                        if referer_url:
+
+                            goto_kwargs[
+                                "referer"
+                            ] = referer_url
+
+                        response = await page.goto(
+                            url,
+                            **goto_kwargs,
+                        )
+
+                        canonical_url = (
+                            page.url
+                            or url
+                        )
+
+                        last_canonical_url = (
+                            canonical_url
+                        )
+
+                        if response:
+
+                            try:
+
+                                navigation_status = (
+                                    response.status
+                                )
+
+                                last_navigation_status = (
+                                    navigation_status
+                                )
+
+                            except Exception:
+
+                                navigation_status = None
+
+                        # --------------------------------------------------
+                        # Cookie diagnostics.
+                        #
+                        # We record only the number of cookies, never
+                        # their values.
+                        # --------------------------------------------------
+
+                        try:
+
+                            cookie_count = len(
+                                await context.cookies(
+                                    [BASE_URL]
+                                )
+                            )
+
+                        except Exception:
+
+                            cookie_count = None
+
+                        # --------------------------------------------------
+                        # Wait for result cards.
+                        # --------------------------------------------------
+
+                        try:
+
+                            await page.wait_for_selector(
+                                (
+                                    "#srchrslt-adtable "
+                                    "article[data-adid]"
+                                ),
+                                timeout=7000,
+                                state="visible",
+                            )
+
+                        except Exception:
+
+                            pass
+
+                        # --------------------------------------------------
+                        # Wait for breadcrumb.
+                        # --------------------------------------------------
+
+                        try:
+
+                            await page.wait_for_selector(
+                                "#srp-breadcrumb-summary",
+                                timeout=3000,
+                                state="attached",
+                            )
+
+                        except Exception:
+
+                            pass
+
+                        # --------------------------------------------------
+                        # Extract ads.
+                        # --------------------------------------------------
+
+                        results = (
+                            await self.extract_ads_optimized(
+                                page
                             )
                         )
 
-                        if element:
+                        # --------------------------------------------------
+                        # Total result count.
+                        # --------------------------------------------------
 
-                            extras[key] = (
-                                await element.inner_text()
+                        total_result_count = (
+                            await self._get_total_result_count(
+                                page
                             )
+                        )
+
+                        # --------------------------------------------------
+                        # Discover next page.
+                        # --------------------------------------------------
+
+                        next_page_url = (
+                            await self._get_next_page_url(
+                                page,
+                                canonical_url,
+                                total_result_count,
+                            )
+                        )
+
+                        extras: Dict[
+                            str, Any
+                        ] = {}
+
+                        extras[
+                            "canonical_url"
+                        ] = canonical_url
+
+                        extras[
+                            "navigation_status"
+                        ] = navigation_status
+
+                        extras[
+                            "navigation_error"
+                        ] = None
+
+                        extras[
+                            "context_cookie_count"
+                        ] = cookie_count
+
+                        if total_result_count is not None:
+
+                            extras[
+                                "total_result_count"
+                            ] = (
+                                total_result_count
+                            )
+
+                            extras[
+                                "total_pages"
+                            ] = (
+                                (
+                                    total_result_count
+                                    + RESULTS_PER_PAGE
+                                    - 1
+                                )
+                                // RESULTS_PER_PAGE
+                            )
+
+                        extras[
+                            "current_page"
+                        ] = (
+                            _extract_page_number(
+                                canonical_url
+                            )
+                        )
+
+                        extras[
+                            "next_page_url"
+                        ] = next_page_url
+
+                        if extra_selectors:
+
+                            for (
+                                key,
+                                selector,
+                            ) in extra_selectors.items():
+
+                                try:
+
+                                    element = (
+                                        await page.query_selector(
+                                            selector
+                                        )
+                                    )
+
+                                    if element:
+
+                                        extras[key] = (
+                                            await element.inner_text()
+                                        )
+
+                                except Exception:
+
+                                    pass
+
+                        metrics = PageMetrics(
+                            page_number=page_num,
+                            url=url,
+                            start_time=start_time,
+                            end_time=time.time(),
+                            success=True,
+                            retry_count=attempt,
+                            results_count=len(
+                                results
+                            ),
+                        )
+
+                        logger.logger.info(
+                            (
+                                f"[OVERVIEW] "
+                                f"Page {page_num}: "
+                                f"{len(results)} results, "
+                                f"total="
+                                f"{total_result_count}, "
+                                f"next="
+                                f"{next_page_url}, "
+                                f"cookies="
+                                f"{cookie_count}"
+                            )
+                        )
+
+                        return (
+                            results,
+                            metrics,
+                            extras,
+                            next_page_url,
+                        )
+
+                    except Exception as exc:
+
+                        last_error = exc
+
+                        navigation_error = str(
+                            exc
+                        )
+
+                        last_navigation_error = (
+                            navigation_error
+                        )
+
+                        try:
+
+                            canonical_url = (
+                                page.url
+                                if page
+                                else None
+                            )
+
+                        except Exception:
+
+                            canonical_url = None
+
+                        if canonical_url:
+
+                            last_canonical_url = (
+                                canonical_url
+                            )
+
+                        error_context = ErrorContext(
+                            operation=(
+                                "ultra_page_fetch"
+                            ),
+                            page_number=page_num,
+                            url=url,
+                            retry_attempt=attempt,
+                        )
+
+                        structured_error = (
+                            ErrorClassifier.classify_exception(
+                                exc,
+                                error_context,
+                                "page_fetch",
+                            )
+                        )
+
+                        # --------------------------------------------------
+                        # Detailed logging.
+                        # --------------------------------------------------
+
+                        if _is_redirect_error(
+                            exc
+                        ):
+
+                            logger.logger.warning(
+                                (
+                                    "[OVERVIEW] "
+                                    f"Page {page_num} "
+                                    "navigation returned "
+                                    "ERR_TOO_MANY_REDIRECTS "
+                                    f"on attempt "
+                                    f"{attempt + 1}/"
+                                    f"{retry_count + 1}. "
+                                    f"url={url}, "
+                                    f"referer="
+                                    f"{referer_url}"
+                                )
+                            )
+
+                        else:
+
+                            logger.logger.warning(
+                                (
+                                    "[OVERVIEW] "
+                                    f"Page {page_num} "
+                                    f"failed on attempt "
+                                    f"{attempt + 1}/"
+                                    f"{retry_count + 1}: "
+                                    f"{exc}"
+                                )
+                            )
+
+                        # --------------------------------------------------
+                        # Retry.
+                        # --------------------------------------------------
+
+                        if (
+                            attempt
+                            < retry_count
+                            and
+                            structured_error.should_retry(
+                                retry_count
+                            )
+                        ):
+
+                            if _is_redirect_error(
+                                exc
+                            ):
+
+                                wait_time = random.uniform(
+                                    REDIRECT_RETRY_DELAY_MIN,
+                                    REDIRECT_RETRY_DELAY_MAX,
+                                )
+
+                            else:
+
+                                wait_time = min(
+                                    (
+                                        2 ** attempt
+                                    )
+                                    + random.uniform(
+                                        0,
+                                        0.5,
+                                    ),
+                                    NORMAL_RETRY_DELAY_MAX,
+                                )
+
+                            await asyncio.sleep(
+                                wait_time
+                            )
+
+                            continue
+
+                        break
+
+                    finally:
+
+                        if page:
+
+                            try:
+
+                                await page.close()
+
+                            except Exception:
+
+                                pass
+
+            finally:
+
+                # ----------------------------------------------------------
+                # CRITICAL:
+                #
+                # Only release the context if this method owns it.
+                #
+                # In the normal multi-page path, the main scraper owns it.
+                # ----------------------------------------------------------
+
+                if owns_context:
+
+                    try:
+
+                        await self.browser_manager.release_context(
+                            context
+                        )
 
                     except Exception:
 
                         pass
 
-            metrics = PageMetrics(
-                page_number=page_num,
-                url=url,
-                start_time=start_time,
-                end_time=time.time(),
-                success=True,
-                retry_count=attempts_used,
-                results_count=len(results),
-            )
+        # ------------------------------------------------------------------
+        # Failed page
+        # ------------------------------------------------------------------
 
-            logger.logger.info(
-                f"[OVERVIEW] Page {page_num}: "
-                f"{len(results)} results, "
-                f"total={total_result_count}, "
-                f"next={next_page_url}"
-            )
+        error_message = (
+            str(last_error)
+            if last_error
+            else "Unknown error"
+        )
 
-            return (
-                results,
-                metrics,
-                extras,
-                next_page_url,
-                active_page,
-            )
+        metrics = PageMetrics(
+            page_number=page_num,
+            url=url,
+            start_time=start_time,
+            end_time=time.time(),
+            success=False,
+            retry_count=last_attempt,
+            error_message=error_message,
+            results_count=0,
+        )
 
-        except Exception as exc:
+        extras = {
+            "canonical_url": (
+                last_canonical_url
+            ),
+            "navigation_error": (
+                last_navigation_error
+            ),
+            "navigation_status": (
+                last_navigation_status
+            ),
+            "next_page_url": None,
+        }
 
-            error_context = ErrorContext(
-                operation="ultra_page_processing",
-                page_number=page_num,
-                url=url,
-                retry_attempt=attempts_used,
-            )
-
-            try:
-
-                structured_error = (
-                    ErrorClassifier.classify_exception(
-                        exc,
-                        error_context,
-                        "page_processing",
-                    )
-                )
-
-                logger.log_error(
-                    structured_error
-                )
-
-            except Exception:
-                pass
-
-            error_message = str(exc)
-
-            metrics = PageMetrics(
-                page_number=page_num,
-                url=url,
-                start_time=start_time,
-                end_time=time.time(),
-                success=False,
-                retry_count=attempts_used,
-                error_message=error_message,
-                results_count=0,
-            )
-
-            return (
-                [],
-                metrics,
-                {
-                    "processing_error": error_message,
-                    "canonical_url": canonical_url,
-                    "current_page": page_num,
-                },
-                None,
-                active_page,
-            )
+        return (
+            [],
+            metrics,
+            extras,
+            None,
+        )
 
     # ----------------------------------------------------------------------
     # Main scraper
@@ -1440,21 +1780,30 @@ class UltraOptimizedScraper:
             "ultra_scraper"
         )
 
-        warning_manager = WarningManager()
+        warning_manager = (
+            WarningManager()
+        )
 
-        tracker = PerformanceTracker()
+        tracker = (
+            PerformanceTracker()
+        )
+
         tracker.start_request()
 
         with error_handling_context(
-            operation="ultra_multi_page_scrape",
+            operation=(
+                "ultra_multi_page_scrape"
+            ),
             logger=logger,
         ) as context_info:
 
-            # ----------------------------------------------------------
-            # Page count
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
+            # page_count
+            # --------------------------------------------------------------
 
-            requested_page_count = page_count
+            requested_page_count = (
+                page_count
+            )
 
             if page_count is not None:
 
@@ -1472,8 +1821,8 @@ class UltraOptimizedScraper:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            "page_count must be "
-                            "an integer"
+                            "page_count "
+                            "must be an integer"
                         ),
                     )
 
@@ -1482,20 +1831,25 @@ class UltraOptimizedScraper:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            "page_count must be >= 1"
+                            "page_count "
+                            "must be >= 1"
                         ),
                     )
 
-                if page_count > MAX_PAGE_LIMIT:
+                if (
+                    page_count
+                    > MAX_PAGE_LIMIT
+                ):
 
                     warning_manager.add_warning(
                         (
-                            f"page_count={page_count} "
-                            f"exceeds the maximum of "
+                            f"page_count="
+                            f"{page_count} exceeds "
+                            f"the maximum of "
                             f"{MAX_PAGE_LIMIT}. "
                             f"Only the first "
-                            f"{MAX_PAGE_LIMIT} pages "
-                            "will be processed."
+                            f"{MAX_PAGE_LIMIT} "
+                            "pages will be processed."
                         ),
                         ErrorSeverity.MEDIUM,
                         context_info.context,
@@ -1524,11 +1878,11 @@ class UltraOptimizedScraper:
                     MAX_AUTOMATIC_PAGES
                 )
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
             # Initial URL
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
-            if category_id:
+            if category_id is not None:
 
                 current_page_url = (
                     _build_category_search_url(
@@ -1564,7 +1918,7 @@ class UltraOptimizedScraper:
                     )
 
                     price_path = (
-                        f"/preis:"
+                        "/preis:"
                         f"{min_value}:"
                         f"{max_value}"
                     )
@@ -1575,25 +1929,30 @@ class UltraOptimizedScraper:
                 )
 
                 params: Dict[
-                    str,
-                    Any,
+                    str, Any
                 ] = {}
 
                 if query:
-                    params["keywords"] = query
+
+                    params[
+                        "keywords"
+                    ] = query
 
                 if location:
+
                     params[
                         "locationStr"
                     ] = location
 
                 if radius:
+
                     params[
                         "radius"
                     ] = radius
 
                 param_string = (
-                    f"?{urlencode(params)}"
+                    "?"
+                    + urlencode(params)
                     if params
                     else ""
                 )
@@ -1604,9 +1963,9 @@ class UltraOptimizedScraper:
                     + param_string
                 )
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
             # State
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
             all_results: List[
                 Dict[str, Any]
@@ -1621,45 +1980,65 @@ class UltraOptimizedScraper:
             ] = []
 
             seen_adids = set()
+
             visited_page_urls = set()
 
             page_num = 1
+
             stop_reason = None
 
-            discovered_total_result_count = None
-            discovered_total_pages = None
+            discovered_total_result_count = (
+                None
+            )
 
-            duplicate_results_total = 0
+            discovered_total_pages = (
+                None
+            )
 
-            # ----------------------------------------------------------
-            # SINGLE SESSION CONTEXT
+            total_extracted = 0
+
+            total_new_results = 0
+
+            total_duplicates = 0
+
+            # --------------------------------------------------------------
+            # CRITICAL FIX:
             #
-            # This is the critical correction.
+            # One BrowserContext for the COMPLETE scrape.
             #
-            # The context remains alive for ALL pages.
-            # Cookies/local storage/session state therefore remain intact.
-            # ----------------------------------------------------------
+            # Previously get_context()/release_context() happened inside
+            # ultra_optimized_fetch_page() for every page.
+            #
+            # release_context() calls clear_cookies().
+            #
+            # Therefore the old implementation destroyed session state
+            # after every pagination page.
+            # --------------------------------------------------------------
 
-            context = None
-            page = None
+            scrape_context: Optional[
+                BrowserContext
+            ] = None
+
+            previous_canonical_url = None
 
             try:
 
-                context = (
+                scrape_context = (
                     await self.browser_manager.get_context()
                 )
 
-                page = (
-                    await context.new_page()
+                logger.logger.info(
+                    (
+                        "[OVERVIEW] "
+                        "Acquired persistent "
+                        "BrowserContext for "
+                        "complete pagination session."
+                    )
                 )
 
-                await self._prepare_page(
-                    page
-                )
-
-                # ------------------------------------------------------
+                # ----------------------------------------------------------
                 # Pagination loop
-                # ------------------------------------------------------
+                # ----------------------------------------------------------
 
                 while True:
 
@@ -1671,25 +2050,19 @@ class UltraOptimizedScraper:
                     ):
 
                         stop_reason = (
-                            "page_count_limit_reached"
-                            if requested_page_count
-                            is not None
-                            else
                             "automatic_page_limit_reached"
+                            if requested_page_count
+                            is None
+                            else
+                            "page_count_limit_reached"
                         )
 
                         break
 
-                    # --------------------------------------------------
-                    # URL loop protection
-                    # --------------------------------------------------
-
                     normalized_url = (
-                        current_page_url
-                        .split(
-                            "#",
-                            1,
-                        )[0]
+                        _normalize_url(
+                            current_page_url
+                        )
                     )
 
                     if (
@@ -1698,11 +2071,14 @@ class UltraOptimizedScraper:
                     ):
 
                         logger.logger.warning(
-                            "[OVERVIEW] Pagination "
-                            "returned an already "
-                            "visited URL on page "
-                            f"{page_num}: "
-                            f"{current_page_url}"
+                            (
+                                "[OVERVIEW] "
+                                "Pagination returned "
+                                "an already visited "
+                                f"URL on page "
+                                f"{page_num}: "
+                                f"{current_page_url}"
+                            )
                         )
 
                         stop_reason = (
@@ -1716,29 +2092,57 @@ class UltraOptimizedScraper:
                     )
 
                     logger.logger.info(
-                        "[OVERVIEW] Fetching page "
-                        f"{page_num}: "
-                        f"{current_page_url}"
-                    )
-
-                    # --------------------------------------------------
-                    # Fetch using SAME context/page.
-                    # --------------------------------------------------
-
-                    (
-                        page_results,
-                        page_metrics,
-                        page_extras,
-                        next_page_url,
-                        page,
-                    ) = await (
-                        self.ultra_optimized_fetch_page(
-                            context=context,
-                            page=page,
-                            url=current_page_url,
-                            page_num=page_num,
+                        (
+                            "[OVERVIEW] "
+                            f"Fetching page "
+                            f"{page_num}: "
+                            f"{current_page_url}"
                         )
                     )
+
+                    try:
+
+                        (
+                            page_results,
+                            page_metrics,
+                            page_extras,
+                            next_page_url,
+                        ) = (
+                            await self.ultra_optimized_fetch_page(
+                                context=scrape_context,
+                                url=current_page_url,
+                                page_num=page_num,
+                                referer_url=(
+                                    previous_canonical_url
+                                ),
+                            )
+                        )
+
+                    except Exception as exc:
+
+                        logger.log_error(
+                            ErrorClassifier.classify_exception(
+                                exc,
+                                ErrorContext(
+                                    operation=(
+                                        "sequential_page_fetch"
+                                    ),
+                                    page_number=(
+                                        page_num
+                                    ),
+                                    url=(
+                                        current_page_url
+                                    ),
+                                ),
+                                "page_execution",
+                            )
+                        )
+
+                        stop_reason = (
+                            "page_fetch_exception"
+                        )
+
+                        break
 
                     all_metrics.append(
                         page_metrics
@@ -1748,65 +2152,9 @@ class UltraOptimizedScraper:
                         page_metrics
                     )
 
-                    # --------------------------------------------------
-                    # Page detail
-                    # --------------------------------------------------
-
-                    page_detail = {
-                        "page_number": page_num,
-                        "url": current_page_url,
-                        "canonical_url": (
-                            page_extras.get(
-                                "canonical_url"
-                            )
-                        ),
-                        "success": (
-                            page_metrics.success
-                        ),
-                        "extracted": (
-                            len(page_results)
-                        ),
-                        "new": 0,
-                        "duplicates": 0,
-                        "retry_count": (
-                            page_metrics.retry_count
-                        ),
-                        "next_page_url": (
-                            next_page_url
-                        ),
-                    }
-
-                    if page_metrics.error_message:
-
-                        page_detail[
-                            "error"
-                        ] = (
-                            page_metrics.error_message
-                        )
-
-                    if page_extras.get(
-                        "navigation_error"
-                    ):
-
-                        page_detail[
-                            "navigation_error"
-                        ] = page_extras[
-                            "navigation_error"
-                        ]
-
-                    if page_extras.get(
-                        "processing_error"
-                    ):
-
-                        page_detail[
-                            "processing_error"
-                        ] = page_extras[
-                            "processing_error"
-                        ]
-
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
                     # Total-result information
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
 
                     if (
                         page_extras.get(
@@ -1830,62 +2178,112 @@ class UltraOptimizedScraper:
                             // RESULTS_PER_PAGE
                         )
 
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
                     # Failed page
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
 
                     if not page_metrics.success:
 
-                        logger.logger.warning(
-                            "[OVERVIEW] Page "
-                            f"{page_num} failed: "
-                            f"{page_metrics.error_message}"
-                        )
+                        page_detail = {
+                            "page_number": (
+                                page_num
+                            ),
+                            "url": (
+                                current_page_url
+                            ),
+                            "canonical_url": (
+                                page_extras.get(
+                                    "canonical_url"
+                                )
+                            ),
+                            "success": False,
+                            "extracted": 0,
+                            "new": 0,
+                            "duplicates": 0,
+                            "retry_count": (
+                                page_metrics.retry_count
+                            ),
+                            "next_page_url": None,
+                            "error": (
+                                page_metrics.error_message
+                            ),
+                            "navigation_error": (
+                                page_extras.get(
+                                    "navigation_error"
+                                )
+                            ),
+                            "navigation_status": (
+                                page_extras.get(
+                                    "navigation_status"
+                                )
+                            ),
+                        }
 
-                        failed_page_detail = dict(
+                        page_details.append(
                             page_detail
                         )
 
-                        failed_page_detail[
-                            "extracted"
-                        ] = 0
-
-                        failed_page_detail[
-                            "new"
-                        ] = 0
-
-                        failed_page_detail[
-                            "duplicates"
-                        ] = 0
-
-                        page_details.append(
-                            failed_page_detail
+                        logger.logger.warning(
+                            (
+                                "[OVERVIEW] "
+                                f"Page {page_num} "
+                                "failed. "
+                                f"error="
+                                f"{page_metrics.error_message}"
+                            )
                         )
 
-                        # IMPORTANT:
-                        #
-                        # We retain all previous results.
-                        # Nothing is discarded.
                         stop_reason = (
                             "page_fetch_failed"
                         )
 
                         break
 
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
+                    # Successful page
+                    # ------------------------------------------------------
+
+                    total_extracted += (
+                        len(page_results)
+                    )
+
+                    # ------------------------------------------------------
                     # Empty page
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
 
                     if not page_results:
 
-                        logger.logger.info(
-                            "[OVERVIEW] Page "
-                            f"{page_num} returned "
-                            "no results."
-                        )
-
                         page_details.append(
-                            page_detail
+                            {
+                                "page_number": (
+                                    page_num
+                                ),
+                                "url": (
+                                    current_page_url
+                                ),
+                                "canonical_url": (
+                                    page_extras.get(
+                                        "canonical_url"
+                                    )
+                                ),
+                                "success": True,
+                                "extracted": 0,
+                                "new": 0,
+                                "duplicates": 0,
+                                "retry_count": (
+                                    page_metrics.retry_count
+                                ),
+                                "next_page_url": (
+                                    next_page_url
+                                ),
+                                "error": None,
+                                "navigation_error": None,
+                                "navigation_status": (
+                                    page_extras.get(
+                                        "navigation_status"
+                                    )
+                                ),
+                            }
                         )
 
                         stop_reason = (
@@ -1894,9 +2292,9 @@ class UltraOptimizedScraper:
 
                         break
 
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
                     # Deduplication
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
 
                     new_results = []
 
@@ -1937,23 +2335,30 @@ class UltraOptimizedScraper:
                         - len(new_results)
                     )
 
-                    duplicate_results_total += (
+                    total_new_results += (
+                        len(new_results)
+                    )
+
+                    total_duplicates += (
                         duplicate_count
                     )
 
-                    page_detail[
-                        "new"
-                    ] = len(
-                        new_results
+                    logger.logger.info(
+                        (
+                            "[OVERVIEW] "
+                            f"Page {page_num}: "
+                            f"{len(page_results)} "
+                            "extracted, "
+                            f"{len(new_results)} "
+                            "new, "
+                            f"{duplicate_count} "
+                            "duplicates"
+                        )
                     )
 
-                    page_detail[
-                        "duplicates"
-                    ] = duplicate_count
-
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
                     # Publication date
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
 
                     reached_min_publish_date = (
                         False
@@ -1977,21 +2382,65 @@ class UltraOptimizedScraper:
                                 True
                             )
 
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
                     # Add results
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
 
                     all_results.extend(
                         new_results
                     )
 
+                    # ------------------------------------------------------
+                    # Page diagnostics
+                    # ------------------------------------------------------
+
                     page_details.append(
-                        page_detail
+                        {
+                            "page_number": (
+                                page_num
+                            ),
+                            "url": (
+                                current_page_url
+                            ),
+                            "canonical_url": (
+                                page_extras.get(
+                                    "canonical_url"
+                                )
+                            ),
+                            "success": True,
+                            "extracted": (
+                                len(page_results)
+                            ),
+                            "new": (
+                                len(new_results)
+                            ),
+                            "duplicates": (
+                                duplicate_count
+                            ),
+                            "retry_count": (
+                                page_metrics.retry_count
+                            ),
+                            "next_page_url": (
+                                next_page_url
+                            ),
+                            "error": None,
+                            "navigation_error": None,
+                            "navigation_status": (
+                                page_extras.get(
+                                    "navigation_status"
+                                )
+                            ),
+                            "context_cookie_count": (
+                                page_extras.get(
+                                    "context_cookie_count"
+                                )
+                            ),
+                        }
                     )
 
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
                     # No new results
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
 
                     if not new_results:
 
@@ -2001,11 +2450,13 @@ class UltraOptimizedScraper:
 
                         break
 
-                    # --------------------------------------------------
-                    # Publication date stop
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
+                    # Publication-date stop
+                    # ------------------------------------------------------
 
-                    if reached_min_publish_date:
+                    if (
+                        reached_min_publish_date
+                    ):
 
                         stop_reason = (
                             "min_publish_date_reached"
@@ -2013,16 +2464,18 @@ class UltraOptimizedScraper:
 
                         break
 
-                    # --------------------------------------------------
-                    # No next page
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
+                    # Pagination exhausted
+                    # ------------------------------------------------------
 
                     if not next_page_url:
 
                         logger.logger.info(
-                            "[OVERVIEW] Page "
-                            f"{page_num} has no "
-                            "next page."
+                            (
+                                "[OVERVIEW] "
+                                f"Page {page_num} "
+                                "has no next page."
+                            )
                         )
 
                         stop_reason = (
@@ -2031,9 +2484,9 @@ class UltraOptimizedScraper:
 
                         break
 
-                    # --------------------------------------------------
-                    # Total-result-count exhaustion
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
+                    # Total result count exhausted
+                    # ------------------------------------------------------
 
                     if (
                         discovered_total_pages
@@ -2051,9 +2504,16 @@ class UltraOptimizedScraper:
 
                             break
 
-                    # --------------------------------------------------
-                    # Continue
-                    # --------------------------------------------------
+                    # ------------------------------------------------------
+                    # Continue pagination
+                    # ------------------------------------------------------
+
+                    previous_canonical_url = (
+                        page_extras.get(
+                            "canonical_url"
+                        )
+                        or current_page_url
+                    )
 
                     current_page_url = (
                         next_page_url
@@ -2067,49 +2527,54 @@ class UltraOptimizedScraper:
 
                     await asyncio.sleep(
                         random.uniform(
-                            MIN_PAGE_DELAY,
-                            MAX_PAGE_DELAY,
+                            PAGE_DELAY_MIN,
+                            PAGE_DELAY_MAX,
                         )
                     )
 
             finally:
 
-                # ------------------------------------------------------
-                # Release the Page.
-                # ------------------------------------------------------
+                # ----------------------------------------------------------
+                # CRITICAL:
+                #
+                # Context is released ONLY after the COMPLETE pagination
+                # session.
+                #
+                # browser.py will clear cookies HERE, not between pages.
+                # ----------------------------------------------------------
 
-                if page:
-
-                    try:
-
-                        await page.close()
-
-                    except Exception:
-
-                        pass
-
-                # ------------------------------------------------------
-                # Release the Context ONLY AFTER COMPLETE SCRAPE.
-                # ------------------------------------------------------
-
-                if context:
+                if scrape_context:
 
                     try:
 
-                        await (
-                            self.browser_manager
-                            .release_context(
-                                context
+                        await self.browser_manager.release_context(
+                            scrape_context
+                        )
+
+                        logger.logger.info(
+                            (
+                                "[OVERVIEW] "
+                                "Released persistent "
+                                "BrowserContext after "
+                                "complete pagination "
+                                "session."
                             )
                         )
 
-                    except Exception:
+                    except Exception as exc:
 
-                        pass
+                        logger.logger.warning(
+                            (
+                                "[OVERVIEW] "
+                                "Could not release "
+                                f"context cleanly: "
+                                f"{exc}"
+                            )
+                        )
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
             # Final deduplication
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
             all_results = (
                 _deduplicate_results(
@@ -2117,9 +2582,9 @@ class UltraOptimizedScraper:
                 )
             )
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
             # Metrics
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
             pages_attempted = len(
                 all_metrics
@@ -2141,6 +2606,36 @@ class UltraOptimizedScraper:
                 else 0
             )
 
+            # --------------------------------------------------------------
+            # Expected pages
+            # --------------------------------------------------------------
+
+            if (
+                discovered_total_pages
+                is not None
+            ):
+
+                expected_pages = min(
+                    discovered_total_pages,
+                    effective_page_count,
+                )
+
+            else:
+
+                expected_pages = (
+                    effective_page_count
+                )
+
+            pages_remaining = max(
+                0,
+                expected_pages
+                - pages_attempted,
+            )
+
+            # --------------------------------------------------------------
+            # Tracker
+            # --------------------------------------------------------------
+
             tracker.set_concurrent_level(
                 1
             )
@@ -2154,7 +2649,8 @@ class UltraOptimizedScraper:
                 browser_metrics[
                     "contexts_in_use"
                 ]
-                + browser_metrics[
+                +
+                browser_metrics[
                     "contexts_in_pool"
                 ]
             )
@@ -2164,25 +2660,25 @@ class UltraOptimizedScraper:
             )
 
             task_metrics = (
-                self.task_manager.get_metrics()
+                self.task_manager
+                .get_metrics()
             )
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
             # Failed pages
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
             failed_pages = [
                 detail
                 for detail in page_details
                 if not detail.get(
-                    "success",
-                    False,
+                    "success"
                 )
             ]
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
             # Warnings
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
             if success_rate < 90:
 
@@ -2202,7 +2698,8 @@ class UltraOptimizedScraper:
                 )
 
             if (
-                request_metrics.total_time > 8.0
+                request_metrics.total_time
+                > 8.0
                 and pages_attempted > 1
             ):
 
@@ -2216,14 +2713,35 @@ class UltraOptimizedScraper:
                     context_info.context,
                     impact_description=(
                         "Sequential pagination is used "
-                        "to ensure complete result "
-                        "retrieval."
+                        "to ensure complete result retrieval."
                     ),
                 )
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
+            # Partial-result warning
+            # --------------------------------------------------------------
+
+            if failed_pages:
+
+                warning_manager.add_warning(
+                    (
+                        f"{len(failed_pages)} page(s) "
+                        "could not be retrieved."
+                    ),
+                    ErrorSeverity.MEDIUM,
+                    context_info.context,
+                    affected_items=[
+                        "failed_pages"
+                    ],
+                    impact_description=(
+                        "The returned result set "
+                        "is incomplete."
+                    ),
+                )
+
+            # --------------------------------------------------------------
             # Logging
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
             logger.log_operation_summary(
                 operation=(
@@ -2246,18 +2764,19 @@ class UltraOptimizedScraper:
                 ),
             )
 
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
             # Response
-            # ----------------------------------------------------------
+            # --------------------------------------------------------------
 
             response = {
-
                 "success": True,
 
-                "results": all_results,
-
-                "unique_results": len(
+                "results": (
                     all_results
+                ),
+
+                "unique_results": (
+                    len(all_results)
                 ),
 
                 "time_taken": round(
@@ -2274,10 +2793,19 @@ class UltraOptimizedScraper:
                 ),
 
                 "performance_metrics": {
-
                     **request_metrics.to_dict(),
 
+                    # ------------------------------------------------------
+                    # Existing API field:
+                    #
+                    # This means ATTEMPTED pages.
+                    # ------------------------------------------------------
+
                     "pages_requested": (
+                        pages_attempted
+                    ),
+
+                    "pages_attempted": (
                         pages_attempted
                     ),
 
@@ -2285,9 +2813,33 @@ class UltraOptimizedScraper:
                         successful_pages
                     ),
 
+                    "pages_expected": (
+                        expected_pages
+                    ),
+
+                    "pages_remaining": (
+                        pages_remaining
+                    ),
+
                     "success_rate": round(
                         success_rate,
                         2,
+                    ),
+
+                    "results_per_page": (
+                        RESULTS_PER_PAGE
+                    ),
+
+                    "results_extracted": (
+                        total_extracted
+                    ),
+
+                    "new_results": (
+                        total_new_results
+                    ),
+
+                    "duplicates_total": (
+                        total_duplicates
                     ),
 
                     "optimization_level": (
@@ -2300,7 +2852,8 @@ class UltraOptimizedScraper:
                         "automatic_until_exhausted"
                         if requested_page_count
                         is None
-                        else "explicit_limit"
+                        else
+                        "explicit_limit"
                     ),
 
                     "page_limit": (
@@ -2319,32 +2872,8 @@ class UltraOptimizedScraper:
                         stop_reason
                     ),
 
-                    "category_id": (
-                        category_id
-                    ),
-
-                    "category_slug": (
-                        category_slug
-                    ),
-
-                    "pages_available": (
-                        discovered_total_pages
-                    ),
-
-                    "pages_attempted": (
-                        pages_attempted
-                    ),
-
-                    "pages_successful": (
-                        successful_pages
-                    ),
-
-                    "failed_page_count": (
-                        len(failed_pages)
-                    ),
-
-                    "duplicate_results": (
-                        duplicate_results_total
+                    "partial_results": (
+                        bool(failed_pages)
                     ),
 
                     "failed_pages": (
@@ -2355,11 +2884,13 @@ class UltraOptimizedScraper:
                         page_details
                     ),
 
-                    "session_pagination": True,
+                    "category_id": (
+                        category_id
+                    ),
 
-                    "context_reused_across_pages": True,
-
-                    "redirect_recovery": True,
+                    "category_slug": (
+                        category_slug
+                    ),
 
                     "uvloop_enabled": hasattr(
                         asyncio.get_event_loop(),
@@ -2376,62 +2907,36 @@ class UltraOptimizedScraper:
                 ),
 
                 "optimization_features": [
-
                     "uvloop_integration",
-
                     "memory_conscious_processing",
-
                     "advanced_task_management",
-
+                    "persistent_context_per_scrape",
+                    "context_reuse_across_pages",
+                    "session_cookie_continuity",
                     "sequential_pagination",
-
                     "automatic_pagination",
-
                     "real_next_page_href",
-
                     "numbered_pagination_fallback",
-
                     "total_result_count_detection",
-
                     "total_pages_detection",
-
                     "pagination_count_fallback_query_safe",
-
                     "pagination_loop_protection",
-
                     "adid_deduplication",
-
+                    "duplicate_metrics",
                     "intelligent_page_stop",
-
-                    "session_context_pagination",
-
-                    "session_page_reuse",
-
-                    "redirect_recovery",
-
-                    "same_context_recovery",
-
+                    "context_pooling",
                     "automatic_gc",
-
                     "current_kleinanzeigen_result_selector",
-
                     "dual_breadcrumb_selector_support",
-
                     "canonical_url_pagination",
-
+                    "referer_pagination",
                     "category_filtering",
-
                     "scoped_result_extraction",
-
                     "json_ld_fallback",
-
-                    "complete_previous_results_on_page_failure",
+                    "detailed_failed_page_diagnostics",
+                    "partial_result_return",
                 ],
             }
-
-            # ----------------------------------------------------------
-            # Warnings
-            # ----------------------------------------------------------
 
             warnings = (
                 warning_manager
@@ -2507,8 +3012,8 @@ async def ultra_optimized_scrape_inserate(
 
     try:
 
-        return await (
-            scraper.ultra_optimized_scrape(
+        return (
+            await scraper.ultra_optimized_scrape(
                 query=query,
                 location=location,
                 radius=radius,
