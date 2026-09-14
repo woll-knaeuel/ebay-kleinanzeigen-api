@@ -7,6 +7,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Query, Request, HTTPException
 from scrapers.inserate_ultra_optimized import ultra_optimized_scrape_inserate
+from utils.content_filter import content_filter_from_params
 
 router = APIRouter()
 
@@ -49,6 +50,25 @@ async def get_inserate_ultra_optimized(
         None,
         description="Stop fetching once listings published before this datetime (inclusive, format: YYYY-MM-DDTHH:MM:SS)",
     ),
+    include_terms: Optional[str] = Query(
+        None,
+        description="Kommagetrennte Begriffe/Regex — mind. einer muss in title/description vorkommen",
+    ),
+    exclude_terms: Optional[str] = Query(
+        None,
+        description="Kommagetrennte Begriffe/Regex — keiner darf in title/description vorkommen",
+    ),
+    use_regex: bool = Query(
+        False, description="include_terms/exclude_terms als Regex statt literaler Substrings interpretieren"
+    ),
+    match_all_include: bool = Query(
+        False, description="true = alle include_terms müssen matchen (AND), false = mind. einer (OR)"
+    ),
+    case_sensitive: bool = Query(False, description="Groß-/Kleinschreibung beachten"),
+    filter_fields: str = Query(
+        "title,description",
+        description="Felder für die Filterung: title, description (description_full ist an diesem Endpunkt nicht verfügbar)",
+    ),
 ):
     """
     Fetch listings based on search criteria.
@@ -64,10 +84,33 @@ async def get_inserate_ultra_optimized(
     restricts results to that Kleinanzeigen category (e.g. Elektronik ->
     Haushaltsgeräte), equivalent to manually navigating to
     https://www.kleinanzeigen.de/s-multimedia-elektronik/38106/liebherr/k0c161...
+
+    Content filtering (include_terms/exclude_terms) is applied as
+    post-processing on already-fetched results, since Kleinanzeigen's own
+    search does not support server-side full-text include/exclude filtering.
     """
     browser_manager = request.app.state.browser_manager
     if not browser_manager:
         raise HTTPException(status_code=503, detail="Service unavailable")
+
+    if "description_full" in [f.strip() for f in filter_fields.split(",")]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "description_full ist an /inserate nicht verfügbar (nur "
+                "Vorschautext aus der Trefferliste). Nutze /inserate-detailed "
+                "für die vollständige Beschreibung."
+            ),
+        )
+
+    content_filter = content_filter_from_params(
+        include_terms=include_terms,
+        exclude_terms=exclude_terms,
+        use_regex=use_regex,
+        match_all_include=match_all_include,
+        case_sensitive=case_sensitive,
+        filter_fields=filter_fields,
+    )
 
     try:
         # Execute ultra-optimized scraping
@@ -103,6 +146,22 @@ async def get_inserate_ultra_optimized(
                 "category_slug": metrics.get("category_slug"),
             }
             result["performance_metrics"] = essential_metrics
+
+        # Content filtering (post-processing, da Kleinanzeigen selbst
+        # keine serverseitige Volltextfilterung unterstützt)
+        if content_filter.active:
+            original_results = result.get("results", [])
+            before_count = len(original_results)
+            filtered_results = content_filter.apply(original_results)
+
+            result["results"] = filtered_results
+            result["unique_results"] = len(filtered_results)
+            result["content_filter_meta"] = {
+                **content_filter.summary(),
+                "results_before_filter": before_count,
+                "results_after_filter": len(filtered_results),
+                "filtered_out": before_count - len(filtered_results),
+            }
 
         return result
 
