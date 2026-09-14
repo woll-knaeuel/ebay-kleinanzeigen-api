@@ -5,11 +5,12 @@ Ultra-optimized combined endpoint for maximum performance.
 import asyncio
 import time
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from fastapi import APIRouter, Query, HTTPException, Request
 
 from scrapers.inserate_ultra_optimized import ultra_optimized_scrape_inserate
 from scrapers.inserat import get_inserate_details_optimized
+from utils.content_filter import content_filter_from_params
 
 router = APIRouter()
 
@@ -26,6 +27,21 @@ async def get_inserate_with_details(
     max_concurrent_details: int = Query(
         5, ge=1, le=10, description="Maximum concurrent detail fetches"
     ),
+    include_terms: Optional[str] = Query(
+        None, description="Kommagetrennte Begriffe/Regex — mind. einer muss vorkommen"
+    ),
+    exclude_terms: Optional[str] = Query(
+        None, description="Kommagetrennte Begriffe/Regex — keiner darf vorkommen"
+    ),
+    use_regex: bool = Query(False, description="Begriffe als Regex interpretieren"),
+    match_all_include: bool = Query(
+        False, description="true = alle include_terms müssen matchen (AND)"
+    ),
+    case_sensitive: bool = Query(False),
+    filter_fields: str = Query(
+        "title,description",
+        description="title, description und/oder description_full (nur hier verfügbar)",
+    ),
 ):
     """
     Fetch listings with detailed information in a single request.
@@ -33,10 +49,26 @@ async def get_inserate_with_details(
     Combines listing search and detail fetching operations. First searches for
     listings based on criteria, then concurrently fetches detailed information
     for each found listing, returning combined results.
+
+    Content filtering is applied in two stages:
+    1. Pre-filter on title/description (preview fields) BEFORE the detail
+       fetch — this skips the expensive per-listing detail request entirely
+       for listings that would be filtered out anyway.
+    2. Post-filter on description_full (if requested) AFTER the detail fetch,
+       since the full description is only available once details are loaded.
     """
     browser_manager = request.app.state.browser_manager
     if not browser_manager:
         raise HTTPException(status_code=503, detail="Service unavailable")
+
+    content_filter = content_filter_from_params(
+        include_terms=include_terms,
+        exclude_terms=exclude_terms,
+        use_regex=use_regex,
+        match_all_include=match_all_include,
+        case_sensitive=case_sensitive,
+        filter_fields=filter_fields,
+    )
 
     try:
         start_time = time.time()
@@ -56,8 +88,32 @@ async def get_inserate_with_details(
             raise HTTPException(status_code=500, detail="Failed to fetch listings")
 
         listings = listings_result.get("results", [])
+        content_filter_meta: Dict[str, Any] = {}
+
+        # ------------------------------------------------------------------
+        # Pre-filter (title/description) BEFORE the expensive detail fetch.
+        # Only applicable if the filter does not exclusively rely on
+        # description_full, which isn't available yet at this point.
+        # ------------------------------------------------------------------
+        preview_fields = {"title", "description"} & set(content_filter.fields)
+
+        if content_filter.active and preview_fields:
+            pre_filter = content_filter_from_params(
+                include_terms=include_terms,
+                exclude_terms=exclude_terms,
+                use_regex=use_regex,
+                match_all_include=match_all_include,
+                case_sensitive=case_sensitive,
+                filter_fields=",".join(preview_fields),
+            )
+            before_pre = len(listings)
+            listings = pre_filter.apply(listings)
+            content_filter_meta["pre_filter_before"] = before_pre
+            content_filter_meta["pre_filter_after"] = len(listings)
+            content_filter_meta["pre_filter_removed"] = before_pre - len(listings)
+
         if not listings:
-            return {
+            response = {
                 "success": True,
                 "data": [],
                 "unique_results": 0,
@@ -68,6 +124,12 @@ async def get_inserate_with_details(
                     "success_rate": 100,
                 },
             }
+            if content_filter.active:
+                response["content_filter_meta"] = {
+                    **content_filter.summary(),
+                    **content_filter_meta,
+                }
+            return response
 
         # Phase 2: Fetch details concurrently with controlled concurrency
         detail_request_id = f"req-{uuid.uuid4().hex[:8]}"
@@ -124,6 +186,16 @@ async def get_inserate_with_details(
                 combined_data.append(result)
                 successful_details += 1
 
+        # ------------------------------------------------------------------
+        # Post-filter (full filter, incl. description_full) AFTER detail fetch
+        # ------------------------------------------------------------------
+        if content_filter.active:
+            before_post = len(combined_data)
+            combined_data = content_filter.apply(combined_data)
+            content_filter_meta["post_filter_before"] = before_post
+            content_filter_meta["post_filter_after"] = len(combined_data)
+            content_filter_meta["post_filter_removed"] = before_post - len(combined_data)
+
         total_time = time.time() - start_time
 
         # Clean response with minimal metrics
@@ -144,6 +216,12 @@ async def get_inserate_with_details(
                 ),
             },
         }
+
+        if content_filter.active:
+            response["content_filter_meta"] = {
+                **content_filter.summary(),
+                **content_filter_meta,
+            }
 
         return response
 
