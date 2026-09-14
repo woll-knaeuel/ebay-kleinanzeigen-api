@@ -136,7 +136,14 @@ async def get_inserate_ultra_optimized(
         # Simplify performance metrics
         if "performance_metrics" in result:
             metrics = result["performance_metrics"]
-            # Keep only essential metrics
+        
+            # Fehlerdetails der letzten fehlgeschlagenen Seite extrahieren,
+            # bevor page_details verworfen wird
+            failed_pages = [
+                pd for pd in metrics.get("page_details", [])
+                if not pd.get("success")
+            ]
+        
             essential_metrics = {
                 "pages_requested": metrics.get("pages_requested", 0),
                 "pages_successful": metrics.get("pages_successful", 0),
@@ -145,7 +152,9 @@ async def get_inserate_ultra_optimized(
                 "category_id": metrics.get("category_id"),
                 "category_slug": metrics.get("category_slug"),
                 "stop_reason": metrics.get("stop_reason"),
+                "failed_pages": failed_pages,  # enthält error_message, error_category, retry_count je Seite
             }
+
             result["performance_metrics"] = essential_metrics
 
         # Content filtering (post-processing, da Kleinanzeigen selbst
