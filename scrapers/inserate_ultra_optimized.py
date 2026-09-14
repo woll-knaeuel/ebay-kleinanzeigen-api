@@ -1452,8 +1452,8 @@ class UltraOptimizedScraper:
 
                 await asyncio.sleep(
                     random.uniform(
-                        0.15,
-                        0.35,
+                        1.5, 
+                        2.5,
                     )
                 )
 
