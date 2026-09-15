@@ -2210,3 +2210,4 @@ async def ultra_optimized_scrape_inserate(
     finally:
 
         await scraper.cleanup()
+      
