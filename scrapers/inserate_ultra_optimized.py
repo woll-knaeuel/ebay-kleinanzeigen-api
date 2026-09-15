@@ -531,11 +531,7 @@ class UltraOptimizedScraper:
 
         try:
 
-            selector = (
-                "#srchrslt-adtable > "
-                "li[data-clickable='card'] "
-                "article[data-adid]"
-            )
+            selector = "article[data-adid]"
 
             items = (
                 await page.query_selector_all(
@@ -1255,6 +1251,10 @@ class UltraOptimizedScraper:
                     canonical_url = None
 
                     try:
+
+                        context = (
+                            await self.browser_manager.get_context()
+                        )
 
                         page = (
                             await context.new_page()
