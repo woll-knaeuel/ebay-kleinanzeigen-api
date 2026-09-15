@@ -38,24 +38,44 @@ def inject_page(url: str, page_num: int) -> str:
     parsed = urlparse(url)
     path = unquote(parsed.path)
 
-    # Strip any existing page segment
-    segments = [
-        s
-        for s in path.strip("/").split("/")
-        if s and not re.match(r"^s-seite:\d+$", s) and not re.match(r"^seite:\d+$", s)
-    ]
+    # Find existing page segment index and prefix style, if any.
+    # We replace it in-place later rather than stripping and re-inserting,
+    # so URLs that already contain s-seite:N keep their structure.
+    segments = path.strip("/").split("/")
+    page_idx = None
+    had_s_prefix = False
+    for i, s in enumerate(segments):
+        if not s:
+            continue
+        m = re.match(r"^(s-)?seite:\d+$", s)
+        if m:
+            page_idx = i
+            had_s_prefix = m.group(1) is not None
+            break
+
+    if page_num == 1:
+        # Going to page 1: remove the page segment if present
+        if page_idx is not None:
+            segments.pop(page_idx)
+        new_path = "/" + "/".join(segments)
+        return urlunparse(parsed._replace(path=new_path))
 
     if page_num > 1:
-        filter_idx = next(
-            (i for i, s in enumerate(segments) if re.match(r"^k?\d*c\d+", s)),
-            None,
-        )
-        if filter_idx is not None:
-            # Insert seite:N directly before the filter segment
-            segments.insert(filter_idx, f"seite:{page_num}")
+        if page_idx is not None:
+            # Replace existing page segment, preserving prefix style
+            prefix = "s-" if had_s_prefix else ""
+            segments[page_idx] = f"{prefix}seite:{page_num}"
         else:
-            # Generic search: append s-seite:N before query string
-            segments.append(f"s-seite:{page_num}")
+            # No existing page segment — insert after first s- category prefix,
+            # or append s-seite:N for generic search URLs
+            cat_idx = next(
+                (i for i, s in enumerate(segments) if s.startswith("s-")),
+                None,
+            )
+            if cat_idx is not None:
+                segments.insert(cat_idx + 1, f"seite:{page_num}")
+            else:
+                segments.append(f"s-seite:{page_num}")
 
     new_path = "/" + "/".join(segments)
     return urlunparse(parsed._replace(path=new_path))
