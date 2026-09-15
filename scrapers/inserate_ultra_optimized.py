@@ -521,414 +521,128 @@ class UltraOptimizedScraper:
     # Result extraction
     # ----------------------------------------------------------------------
 
-    @monitor_slow_coroutines(
-        threshold=0.5
-    )
-    async def extract_ads_optimized(
-        self,
-        page,
-    ) -> List[Dict[str, Any]]:
+    @monitor_slow_coroutines(threshold=0.5)
+    async def extract_ads_optimized(self, page: Page) -> List[Dict[str, Any]]:
+        """
+        Extract the complete result grid in ONE browser->Python round trip.
 
+        The previous implementation performed multiple Playwright protocol
+        calls per card (attributes + title + description + evaluate + JSON-LD).
+        With 25 cards/page this created hundreds of cross-process calls.
+        """
         try:
+            raw_results = await page.locator("article[data-adid]").evaluate_all(
+                r"""
+                (articles) => articles.map((el) => {
+                    const text = (node) => (node?.innerText || "").trim();
 
-            selector = "article[data-adid]"
+                    const adid = el.getAttribute("data-adid") || "";
+                    const href = el.getAttribute("data-href") || "";
 
-            items = (
-                await page.query_selector_all(
-                    selector
-                )
+                    const title =
+                        text(el.querySelector("h3 a")) ||
+                        (() => {
+                            const script = el.querySelector(
+                                'script[type="application/ld+json"]'
+                            );
+                            if (!script) return "";
+                            try {
+                                const data = JSON.parse(script.textContent || "{}");
+                                return data.title || data.name || "";
+                            } catch (_) {
+                                return "";
+                            }
+                        })();
+
+                    const description =
+                        text(el.querySelector("h3 + p")) ||
+                        (() => {
+                            const script = el.querySelector(
+                                'script[type="application/ld+json"]'
+                            );
+                            if (!script) return "";
+                            try {
+                                const data = JSON.parse(script.textContent || "{}");
+                                return data.description || "";
+                            } catch (_) {
+                                return "";
+                            }
+                        })();
+
+                    let location = "";
+                    let date = "";
+                    let price = "";
+
+                    for (const span of el.querySelectorAll("span")) {
+                        const value = text(span);
+                        if (!location && /\b\d{5}\b/.test(value)) {
+                            location = value;
+                        }
+                        if (
+                            !date &&
+                            (
+                                /^\d{2}\.\d{2}\.\d{4}$/.test(value) ||
+                                /^Heute,\s*\d{1,2}:\d{2}$/.test(value) ||
+                                /^Gestern,\s*\d{1,2}:\d{2}$/.test(value)
+                            )
+                        ) {
+                            date = value;
+                        }
+                    }
+
+                    for (const paragraph of el.querySelectorAll("p")) {
+                        const value = text(paragraph);
+                        if (value.includes("€") || value === "VB") {
+                            price = value;
+                            break;
+                        }
+                    }
+
+                    return { adid, href, title, description, location, date, price };
+                })
+                """
             )
 
-            results: List[
-                Dict[str, Any]
-            ] = []
+            results = []
+            for item in raw_results:
+                if not isinstance(item, dict):
+                    continue
 
-            batch_size = 10
+                adid = item.get("adid")
+                href = item.get("href")
+                if not adid or not href:
+                    continue
 
-            for index in range(
-                0,
-                len(items),
-                batch_size,
-            ):
+                price_text = item.get("price") or ""
+                if not isinstance(price_text, str):
+                    price_text = ""
+                price_text = price_text.replace("\xa0", " ").replace("€", "").strip()
+                if price_text.upper() != "VB":
+                    price_text = price_text.replace(".", "")
 
-                batch = items[
-                    index:
-                    index + batch_size
-                ]
+                location_raw = item.get("location") or ""
+                if not isinstance(location_raw, str):
+                    location_raw = ""
 
-                tasks = [
-                    self._extract_single_ad(
-                        article
-                    )
-                    for article in batch
-                ]
+                date_raw = item.get("date") or ""
+                if not isinstance(date_raw, str):
+                    date_raw = ""
 
-                batch_results = (
-                    await asyncio.gather(
-                        *tasks,
-                        return_exceptions=True,
-                    )
-                )
-
-                for result in batch_results:
-
-                    if isinstance(
-                        result,
-                        dict,
-                    ):
-
-                        results.append(
-                            result
-                        )
-
-                if (
-                    index
-                    % (batch_size * 5)
-                    == 0
-                ):
-
-                    gc.collect()
+                results.append({
+                    "adid": adid,
+                    "url": urljoin(BASE_URL, href),
+                    "title": str(item.get("title") or "").strip(),
+                    "price": price_text,
+                    "location": _clean_location_text(location_raw),
+                    "description": str(item.get("description") or "").strip(),
+                    "published_at": _parse_kleinanzeigen_date(date_raw),
+                })
 
             return results
-
         except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
 
-            raise HTTPException(
-                status_code=500,
-                detail=str(exc),
-            )
-
-    async def _extract_single_ad(
-        self,
-        article,
-    ) -> Optional[
-        Dict[str, Any]
-    ]:
-
-        try:
-
-            adid = await article.get_attribute(
-                "data-adid"
-            )
-
-            href = await article.get_attribute(
-                "data-href"
-            )
-
-            if not adid or not href:
-                return None
-
-            title_task = (
-                self._get_text_content(
-                    article,
-                    "h3 a",
-                )
-            )
-
-            description_task = (
-                self._get_text_content(
-                    article,
-                    "h3 + p",
-                )
-            )
-
-            metadata_task = article.evaluate(
-                """
-                (el) => {
-                    const result = {
-                        price: "",
-                        location: "",
-                        date: ""
-                    };
-
-                    const spans = Array.from(
-                        el.querySelectorAll("span")
-                    );
-
-                    for (const span of spans) {
-                        const text = (
-                            span.innerText || ""
-                        ).trim();
-
-                        if (/\\b\\d{5}\\b/.test(text)) {
-                            result.location = text;
-                            break;
-                        }
-                    }
-
-                    for (const span of spans) {
-                        const text = (
-                            span.innerText || ""
-                        ).trim();
-
-                        if (
-                            /^\\d{2}\\.\\d{2}\\.\\d{4}$/.test(text) ||
-                            /^Heute,\\s*\\d{1,2}:\\d{2}$/.test(text) ||
-                            /^Gestern,\\s*\\d{1,2}:\\d{2}$/.test(text)
-                        ) {
-                            result.date = text;
-                            break;
-                        }
-                    }
-
-                    const paragraphs = Array.from(
-                        el.querySelectorAll("p")
-                    );
-
-                    for (const paragraph of paragraphs) {
-                        const text = (
-                            paragraph.innerText || ""
-                        ).trim();
-
-                        if (
-                            text.includes("€") ||
-                            text === "VB"
-                        ) {
-                            result.price = text;
-                            break;
-                        }
-                    }
-
-                    return result;
-                }
-                """
-            )
-
-            (
-                title_text,
-                description_text,
-                metadata,
-            ) = await asyncio.gather(
-                title_task,
-                description_task,
-                metadata_task,
-                return_exceptions=True,
-            )
-
-            if not isinstance(
-                title_text,
-                str,
-            ):
-                title_text = ""
-
-            if not isinstance(
-                description_text,
-                str,
-            ):
-                description_text = ""
-
-            if not isinstance(
-                metadata,
-                dict,
-            ):
-                metadata = {}
-
-            # --------------------------------------------------------------
-            # JSON-LD fallback
-            # --------------------------------------------------------------
-
-            ld_data: Dict[str, str] = {}
-
-            try:
-
-                ld_data = await article.evaluate(
-                    """
-                    (el) => {
-                        const script = el.querySelector(
-                            'script[type="application/ld+json"]'
-                        );
-
-                        if (!script) {
-                            return {};
-                        }
-
-                        try {
-                            const data = JSON.parse(
-                                script.textContent || "{}"
-                            );
-
-                            return {
-                                title:
-                                    data.title ||
-                                    data.name ||
-                                    "",
-
-                                description:
-                                    data.description ||
-                                    ""
-                            };
-
-                        } catch (error) {
-                            return {};
-                        }
-                    }
-                    """
-                )
-
-                if not isinstance(
-                    ld_data,
-                    dict,
-                ):
-                    ld_data = {}
-
-            except Exception:
-
-                ld_data = {}
-
-            if not title_text.strip():
-
-                fallback_title = (
-                    ld_data.get(
-                        "title",
-                        "",
-                    )
-                )
-
-                if isinstance(
-                    fallback_title,
-                    str,
-                ):
-
-                    title_text = (
-                        fallback_title.strip()
-                    )
-
-            if not description_text.strip():
-
-                fallback_description = (
-                    ld_data.get(
-                        "description",
-                        "",
-                    )
-                )
-
-                if isinstance(
-                    fallback_description,
-                    str,
-                ):
-
-                    description_text = (
-                        fallback_description.strip()
-                    )
-
-            # --------------------------------------------------------------
-            # Price
-            # --------------------------------------------------------------
-
-            price_text = metadata.get(
-                "price",
-                "",
-            )
-
-            if not isinstance(
-                price_text,
-                str,
-            ):
-
-                price_text = ""
-
-            price_text = (
-                price_text
-                .replace("\xa0", " ")
-                .replace("€", "")
-                .strip()
-            )
-
-            if price_text.upper() != "VB":
-
-                price_text = (
-                    price_text.replace(
-                        ".",
-                        "",
-                    )
-                )
-
-            # --------------------------------------------------------------
-            # Location
-            # --------------------------------------------------------------
-
-            location_raw = metadata.get(
-                "location",
-                "",
-            )
-
-            location_text = (
-                _clean_location_text(
-                    location_raw
-                    if isinstance(
-                        location_raw,
-                        str,
-                    )
-                    else ""
-                )
-            )
-
-            # --------------------------------------------------------------
-            # Publication date
-            # --------------------------------------------------------------
-
-            date_raw = metadata.get(
-                "date",
-                "",
-            )
-
-            published_at = (
-                _parse_kleinanzeigen_date(
-                    date_raw
-                    if isinstance(
-                        date_raw,
-                        str,
-                    )
-                    else ""
-                )
-            )
-
-            listing_url = urljoin(
-                BASE_URL,
-                href,
-            )
-
-            return {
-                "adid": adid,
-                "url": listing_url,
-                "title": title_text.strip(),
-                "price": price_text,
-                "location": location_text,
-                "description": (
-                    description_text.strip()
-                ),
-                "published_at": published_at,
-            }
-
-        except Exception:
-
-            return None
-
-    async def _get_text_content(
-        self,
-        parent_element,
-        selector: str,
-    ) -> str:
-
-        try:
-
-            element = (
-                await parent_element.query_selector(
-                    selector
-                )
-            )
-
-            if element:
-
-                return await element.inner_text()
-
-            return ""
-
-        except Exception:
-
-            return ""
-
-    # ----------------------------------------------------------------------
+        # ----------------------------------------------------------------------
     # Total result count
     # ----------------------------------------------------------------------
 
@@ -949,224 +663,71 @@ class UltraOptimizedScraper:
 
     async def _get_next_page_url(
         self,
-        page,
+        page: Page,
         current_url: str,
         total_result_count: Optional[int] = None,
     ) -> Optional[str]:
-
         try:
+            current_page = _extract_page_number(current_url)
 
-            current_page = (
-                _extract_page_number(
-                    current_url
-                )
+            href = await page.locator(
+                "#srchrslt-pagination a[href], "
+                "#pagination-container a[href], "
+                ".pagination-page a[href], "
+                ".pagination-next a[href]"
+            ).evaluate_all(
+                r"""
+                (links) => {
+                    const current = location.href.split("#", 1)[0].replace(/\/+$/, "");
+                    const pageNo = (href) => {
+                        const match = href.match(/\/s?-?seite:(\d+)/i);
+                        return match ? Number(match[1]) : 1;
+                    };
+
+                    let next = null;
+                    let nextNo = Infinity;
+
+                    for (const link of links) {
+                        const href = link.href;
+                        if (!href) continue;
+
+                        const label = (
+                            link.getAttribute("aria-label") ||
+                            link.getAttribute("title") ||
+                            link.textContent ||
+                            ""
+                        ).trim().toLowerCase();
+
+                        const normalized = href.split("#", 1)[0].replace(/\/+$/, "");
+                        if (normalized === current) continue;
+
+                        const no = pageNo(href);
+                        if (no <= 0) continue;
+
+                        const isNext = label === "nächste" || label === "naechste";
+                        if (isNext) return href;
+
+                        if (no > pageNo(current) && no < nextNo) {
+                            next = href;
+                            nextNo = no;
+                        }
+                    }
+                    return next;
+                }
+                """
             )
 
-            # --------------------------------------------------------------
-            # 1. Explicit "Nächste" link
-            # --------------------------------------------------------------
-
-            next_selectors = [
-                (
-                    "#srchrslt-pagination "
-                    "a[aria-label='Nächste'][href]"
-                ),
-                (
-                    "#srchrslt-pagination "
-                    "a[title='Nächste'][href]"
-                ),
-                (
-                    "#pagination-container "
-                    "a[aria-label='Nächste'][href]"
-                ),
-                (
-                    "#pagination-container "
-                    "a[title='Nächste'][href]"
-                ),
-                (
-                    ".pagination-next "
-                    "a[href]"
-                ),
-            ]
-
-            for selector in next_selectors:
-
-                try:
-
-                    links = (
-                        await page.query_selector_all(
-                            selector
-                        )
-                    )
-
-                    for link in links:
-
-                        href = (
-                            await link.get_attribute(
-                                "href"
-                            )
-                        )
-
-                        if not href:
-                            continue
-
-                        next_url = urljoin(
-                            BASE_URL,
-                            href,
-                        )
-
-                        next_page = (
-                            _extract_page_number(
-                                next_url
-                            )
-                        )
-
-                        if (
-                            next_page
-                            > current_page
-                            and
-                            _normalize_url(
-                                next_url
-                            )
-                            !=
-                            _normalize_url(
-                                current_url
-                            )
-                        ):
-
-                            return next_url
-
-                except Exception:
-
-                    continue
-
-            # --------------------------------------------------------------
-            # 2. Numbered pagination links
-            # --------------------------------------------------------------
-
-            pagination_links = (
-                await page.query_selector_all(
-                    "#srchrslt-pagination "
-                    "a[href], "
-                    "#pagination-container "
-                    "a[href], "
-                    ".pagination-page "
-                    "a[href]"
-                )
-            )
-
-            candidates: List[
-                Tuple[int, str]
-            ] = []
-
-            seen_urls = set()
-
-            for link in pagination_links:
-
-                try:
-
-                    href = (
-                        await link.get_attribute(
-                            "href"
-                        )
-                    )
-
-                    if not href:
-                        continue
-
-                    next_url = urljoin(
-                        BASE_URL,
-                        href,
-                    )
-
-                    if (
-                        _normalize_url(
-                            next_url
-                        )
-                        ==
-                        _normalize_url(
-                            current_url
-                        )
-                    ):
-                        continue
-
-                    candidate_page = (
-                        _extract_page_number(
-                            next_url
-                        )
-                    )
-
-                    if (
-                        candidate_page
-                        <= current_page
-                    ):
-                        continue
-
-                    normalized_candidate = (
-                        _normalize_url(
-                            next_url
-                        )
-                    )
-
-                    if (
-                        normalized_candidate
-                        in seen_urls
-                    ):
-                        continue
-
-                    seen_urls.add(
-                        normalized_candidate
-                    )
-
-                    candidates.append(
-                        (
-                            candidate_page,
-                            next_url,
-                        )
-                    )
-
-                except Exception:
-
-                    continue
-
-            if candidates:
-
-                candidates.sort(
-                    key=lambda item: item[0]
-                )
-
-                return candidates[0][1]
-
-            # --------------------------------------------------------------
-            # 3. Result-count fallback
-            # --------------------------------------------------------------
+            if href:
+                return urljoin(BASE_URL, href)
 
             if total_result_count:
-
-                total_pages = (
-                    total_result_count
-                    + RESULTS_PER_PAGE
-                    - 1
-                ) // RESULTS_PER_PAGE
-
-                next_page = (
-                    current_page + 1
-                )
-
-                if (
-                    next_page
-                    <= total_pages
-                ):
-
-                    return _inject_page(
-                        current_url,
-                        next_page,
-                    )
+                total_pages = (total_result_count + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+                next_page = current_page + 1
+                if next_page <= total_pages:
+                    return _inject_page(current_url, next_page)
 
             return None
-
         except Exception:
-
             return None
 
     # ----------------------------------------------------------------------
@@ -1195,6 +756,7 @@ class UltraOptimizedScraper:
         extra_selectors: Optional[
             Dict[str, str]
         ] = None,
+        discover_next_page: bool = True,
     ) -> Tuple[
         List[Dict],
         PageMetrics,
@@ -1326,17 +888,9 @@ class UltraOptimizedScraper:
                         # their values.
                         # --------------------------------------------------
 
-                        try:
-
-                            cookie_count = len(
-                                await context.cookies(
-                                    [BASE_URL]
-                                )
-                            )
-
-                        except Exception:
-
-                            cookie_count = None
+                        # Cookie enumeration is surprisingly expensive on every page.
+                        # It is diagnostics-only and is therefore disabled on the hot path.
+                        cookie_count = None
 
                         # --------------------------------------------------
                         # Wait for result cards.
@@ -1349,8 +903,8 @@ class UltraOptimizedScraper:
                                     "#srchrslt-adtable "
                                     "article[data-adid]"
                                 ),
-                                timeout=7000,
-                                state="visible",
+                                timeout=4000,
+                                state="attached",
                             )
 
                         except Exception:
@@ -1365,7 +919,7 @@ class UltraOptimizedScraper:
 
                             await page.wait_for_selector(
                                 "#srp-breadcrumb-summary",
-                                timeout=3000,
+                                timeout=1000,
                                 state="attached",
                             )
 
@@ -1394,16 +948,22 @@ class UltraOptimizedScraper:
                         )
 
                         # --------------------------------------------------
-                        # Discover next page.
+                        # Discover next page only when the caller needs it.
+                        # Pages 2..N are already addressed explicitly by
+                        # _inject_page(), so doing this DOM scan there is pure
+                        # overhead.
                         # --------------------------------------------------
 
-                        next_page_url = (
-                            await self._get_next_page_url(
-                                page,
-                                canonical_url,
-                                total_result_count,
+                        if discover_next_page:
+                            next_page_url = (
+                                await self._get_next_page_url(
+                                    page,
+                                    canonical_url,
+                                    total_result_count,
+                                )
                             )
-                        )
+                        else:
+                            next_page_url = None
 
                         extras: Dict[
                             str, Any
@@ -2067,6 +1627,7 @@ class UltraOptimizedScraper:
                         self.ultra_optimized_fetch_page(
                             url=_inject_page(current_page_url, page_num),
                             page_num=page_num,
+                            discover_next_page=False,
                         )
                         for page_num in range(2, last_page + 1)
                     ]
@@ -2182,8 +1743,6 @@ class UltraOptimizedScraper:
                     )
                 else:
                     stop_reason = stop_reason or "single_page_result"
-
-            gc.collect()
 
             # --------------------------------------------------------------
             # Final deduplication
