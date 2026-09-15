@@ -1,16 +1,17 @@
 """
 Ultra-optimized Kleinanzeigen search-result scraper.
 
-WICHTIG:
+Pagination:
+- Automatically follows Kleinanzeigen's real "Nächste" / numbered links.
+- Reads total result count from breadcrumb summary when available.
+- Supports explicit page_count; otherwise paginates until exhausted
+  (max 50 pages).
+- Deduplicates by adid.
 
-Ein BrowserContext wird für die komplette Pagination-Session
-wiederverwendet.
-
-Der Context darf NICHT zwischen einzelnen Seiten freigegeben werden,
-weil release_context() im BrowserManager standardmäßig Cookies löscht.
-
-Dadurch bleiben Cookies, Session-State und andere Browser-Zustände
-zwischen Seite 1, 2, 3, ... erhalten.
+Fetch model:
+- Each page fetch acquires its own BrowserContext from the pool and
+  releases it when the page is done. No persistent context is held
+  across pagination pages.
 
 Features:
 - Automatic pagination based on Kleinanzeigen's real pagination links.
@@ -22,9 +23,7 @@ Features:
 - Supports category filtering.
 - Maximum 50 pages.
 - Deduplicates listings by adid.
-- Persistent BrowserContext for complete scrape session.
 - Retry handling with backoff.
-- Referer propagation between pagination pages.
 - Detailed page failure diagnostics.
 - Partial result return when a later page fails.
 """
@@ -515,6 +514,8 @@ class UltraOptimizedScraper:
         self.browser_manager = (
             browser_manager
         )
+        self.task_manager = None
+        self.memory_processor = None
 
     # ----------------------------------------------------------------------
     # Result extraction
@@ -2505,8 +2506,9 @@ class UltraOptimizedScraper:
             )
 
             task_metrics = (
-                self.task_manager
-                .get_metrics()
+                self.task_manager.get_metrics()
+                if self.task_manager is not None
+                else {}
             )
 
             # --------------------------------------------------------------
@@ -2812,9 +2814,17 @@ class UltraOptimizedScraper:
 
     async def cleanup(self):
 
-        await self.task_manager.cancel_all()
+        if self.task_manager is not None:
+            try:
+                await self.task_manager.cancel_all()
+            except Exception:
+                pass
 
-        await self.memory_processor.cleanup()
+        if self.memory_processor is not None:
+            try:
+                await self.memory_processor.cleanup()
+            except Exception:
+                pass
 
         gc.collect()
 
