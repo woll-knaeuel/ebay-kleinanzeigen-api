@@ -104,13 +104,8 @@ async def root():
 # -------------------------------------------------------------
 
 app.include_router(inserate.router)
-
 app.include_router(inserat.router)
-
-app.include_router(inserate_detailed.router)
-
+app.include_router(inserate_detailed_ultra.router)
 app.include_router(inserate_batch.router)
-
 app.include_router(convert_url.router)
-
 app.include_router(inserate_by_url.router)

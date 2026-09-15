@@ -81,9 +81,6 @@ from utils.error_handling import (
 )
 
 from utils.asyncio_optimizations import (
-    HighPerformanceTaskManager,
-    MemoryOptimizedProcessor,
-    EventLoopOptimizer,
     monitor_slow_coroutines,
 )
 
@@ -518,29 +515,6 @@ class UltraOptimizedScraper:
         self.browser_manager = (
             browser_manager
         )
-
-        self.task_manager = (
-            HighPerformanceTaskManager(
-                max_concurrent=(
-                    browser_manager
-                    ._semaphore
-                    ._value
-                )
-            )
-        )
-
-        self.memory_processor = (
-            MemoryOptimizedProcessor(
-                max_concurrent=(
-                    browser_manager
-                    ._semaphore
-                    ._value
-                ),
-                gc_threshold=50,
-            )
-        )
-
-        EventLoopOptimizer.setup_uvloop()
 
     # ----------------------------------------------------------------------
     # Result extraction
@@ -1218,14 +1192,12 @@ class UltraOptimizedScraper:
     )
     async def ultra_optimized_fetch_page(
         self,
-        context: Optional[BrowserContext],
         url: str,
         page_num: int,
         retry_count: int = 2,
         extra_selectors: Optional[
             Dict[str, str]
         ] = None,
-        referer_url: Optional[str] = None,
     ) -> Tuple[
         List[Dict],
         PageMetrics,
@@ -1256,26 +1228,6 @@ class UltraOptimizedScraper:
 
         last_navigation_status = None
 
-        # ------------------------------------------------------------------
-        # Backward compatibility:
-        #
-        # If no context is supplied, this method temporarily owns one.
-        #
-        # The main scraper ALWAYS supplies a persistent context.
-        # ------------------------------------------------------------------
-
-        owns_context = (
-            context is None
-        )
-
-        if owns_context:
-
-            context = (
-                await self.browser_manager.get_context()
-            )
-
-        assert context is not None
-
         with error_handling_context(
             operation="ultra_fetch_page",
             page_number=page_num,
@@ -1303,15 +1255,6 @@ class UltraOptimizedScraper:
 
                     try:
 
-                        # --------------------------------------------------
-                        # NEW:
-                        #
-                        # Create only a PAGE.
-                        #
-                        # The BrowserContext stays alive for the entire
-                        # multi-page scrape.
-                        # --------------------------------------------------
-
                         page = (
                             await context.new_page()
                         )
@@ -1326,12 +1269,6 @@ class UltraOptimizedScraper:
                                 "domcontentloaded"
                             ),
                         }
-
-                        if referer_url:
-
-                            goto_kwargs[
-                                "referer"
-                            ] = referer_url
 
                         response = await page.goto(
                             url,
@@ -1562,13 +1499,9 @@ class UltraOptimizedScraper:
 
                         last_error = exc
 
-                        navigation_error = str(
-                            exc
-                        )
+                        navigation_error = str(exc)
 
-                        last_navigation_error = (
-                            navigation_error
-                        )
+                        last_navigation_error = navigation_error
 
                         try:
 
@@ -1622,9 +1555,7 @@ class UltraOptimizedScraper:
                                     f"on attempt "
                                     f"{attempt + 1}/"
                                     f"{retry_count + 1}. "
-                                    f"url={url}, "
-                                    f"referer="
-                                    f"{referer_url}"
+                                    f"url={url}"
                                 )
                             )
 
@@ -1699,24 +1630,18 @@ class UltraOptimizedScraper:
             finally:
 
                 # ----------------------------------------------------------
-                # CRITICAL:
-                #
-                # Only release the context if this method owns it.
-                #
-                # In the normal multi-page path, the main scraper owns it.
+                # Always release the context we acquired for this page.
                 # ----------------------------------------------------------
 
-                if owns_context:
+                try:
 
-                    try:
+                    await self.browser_manager.release_context(
+                        context
+                    )
 
-                        await self.browser_manager.release_context(
-                            context
-                        )
+                except Exception:
 
-                    except Exception:
-
-                        pass
+                    pass
 
         # ------------------------------------------------------------------
         # Failed page
@@ -2002,45 +1927,16 @@ class UltraOptimizedScraper:
             total_duplicates = 0
 
             # --------------------------------------------------------------
-            # CRITICAL FIX:
-            #
-            # One BrowserContext for the COMPLETE scrape.
-            #
-            # Previously get_context()/release_context() happened inside
-            # ultra_optimized_fetch_page() for every page.
-            #
-            # release_context() calls clear_cookies().
-            #
-            # Therefore the old implementation destroyed session state
-            # after every pagination page.
-            # --------------------------------------------------------------
+            # Pagination loop.
+            # ----------------------------------------------------------
+            # Each call to ultra_optimized_fetch_page acquires its own
+            # BrowserContext from the pool and releases it when done.
+            # No persistent context is held across pages — this avoids
+            # Kleinanzeigen session accumulation that triggers
+            # ERR_TOO_MANY_REDIRECTS after ~6 sequential navigations.
+            # ----------------------------------------------------------
 
-            scrape_context: Optional[
-                BrowserContext
-            ] = None
-
-            previous_canonical_url = None
-
-            try:
-
-                scrape_context = (
-                    await self.browser_manager.get_context()
-                )
-
-                logger.logger.info(
-                    (
-                        "[OVERVIEW] "
-                        "Acquired persistent "
-                        "BrowserContext for "
-                        "complete pagination session."
-                    )
-                )
-
-                # ----------------------------------------------------------
-                # Pagination loop
-                # ----------------------------------------------------------
-
-                while True:
+            while True:
 
                     if (
                         effective_page_count
@@ -2109,12 +2005,8 @@ class UltraOptimizedScraper:
                             next_page_url,
                         ) = (
                             await self.ultra_optimized_fetch_page(
-                                context=scrape_context,
                                 url=current_page_url,
                                 page_num=page_num,
-                                referer_url=(
-                                    previous_canonical_url
-                                ),
                             )
                         )
 
@@ -2508,13 +2400,6 @@ class UltraOptimizedScraper:
                     # Continue pagination
                     # ------------------------------------------------------
 
-                    previous_canonical_url = (
-                        page_extras.get(
-                            "canonical_url"
-                        )
-                        or current_page_url
-                    )
-
                     current_page_url = (
                         next_page_url
                     )
@@ -2531,46 +2416,6 @@ class UltraOptimizedScraper:
                             PAGE_DELAY_MAX,
                         )
                     )
-
-            finally:
-
-                # ----------------------------------------------------------
-                # CRITICAL:
-                #
-                # Context is released ONLY after the COMPLETE pagination
-                # session.
-                #
-                # browser.py will clear cookies HERE, not between pages.
-                # ----------------------------------------------------------
-
-                if scrape_context:
-
-                    try:
-
-                        await self.browser_manager.release_context(
-                            scrape_context
-                        )
-
-                        logger.logger.info(
-                            (
-                                "[OVERVIEW] "
-                                "Released persistent "
-                                "BrowserContext after "
-                                "complete pagination "
-                                "session."
-                            )
-                        )
-
-                    except Exception as exc:
-
-                        logger.logger.warning(
-                            (
-                                "[OVERVIEW] "
-                                "Could not release "
-                                f"context cleanly: "
-                                f"{exc}"
-                            )
-                        )
 
             # --------------------------------------------------------------
             # Final deduplication
