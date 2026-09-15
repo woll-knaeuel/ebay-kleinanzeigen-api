@@ -1,0 +1,51 @@
+Patch: zwei Methoden in scrapers/inserate_ultra_optimized.py ersetzen
+1. ultra_optimized_fetch_page — Semaphore ergänzen
+
+Ersetze die Context-Beschaffung am Anfang des try-Blocks (innerhalb der for attempt in range(...)-Schleife):
+
+python
+                    try:
+
+                        context: Optional[
+                            BrowserContext
+                        ] = None
+
+                        page: Optional[
+                            Page
+                        ] = None
+
+                        async def _acquire_and_navigate():
+                            nonlocal context, page
+
+                            context = (
+                                await self.browser_manager.get_context()
+                            )
+
+                            page = (
+                                await context.new_page()
+                            )
+
+                        # Concurrency limiter: begrenzt gleichzeitig offene
+                        # Page-Fetches über alle parallelen Seiten hinweg,
+                        # nicht die Context-Anzahl selbst.
+                        await self.browser_manager.execute_with_semaphore(
+                            _acquire_and_navigate()
+                        )
+
+                        # --------------------------------------------------
+                        # Navigation
+                        # --------------------------------------------------
+
+                        goto_kwargs = {
+                            "timeout": 60000,
+                            "wait_until": (
+                                "domcontentloaded"
+                            ),
+                        }
+
+                        response = await page.goto(
+                            url,
+                            **goto_kwargs,
+                        )
+
+(Der Rest der Methode bleibt unverändert — nur der Context-/Page-Aufbau wandert jetzt hinter den Semaphore.)
