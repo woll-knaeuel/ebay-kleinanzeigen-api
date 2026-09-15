@@ -1252,6 +1252,14 @@ class UltraOptimizedScraper:
 
                     try:
 
+                        context: Optional[
+                            BrowserContext
+                        ] = None
+
+                        page: Optional[
+                            Page
+                        ] = None
+
                         context = (
                             await self.browser_manager.get_context()
                         )
@@ -1477,7 +1485,7 @@ class UltraOptimizedScraper:
 
                         logger.logger.info(
                             (
-                                f"[OVERVIEW] "
+                                "[OVERVIEW] "
                                 f"Page {page_num}: "
                                 f"{len(results)} results, "
                                 f"total="
@@ -1543,9 +1551,7 @@ class UltraOptimizedScraper:
                         # Detailed logging.
                         # --------------------------------------------------
 
-                        if _is_redirect_error(
-                            exc
-                        ):
+                        if _is_redirect_error(exc):
 
                             logger.logger.warning(
                                 (
@@ -1577,18 +1583,20 @@ class UltraOptimizedScraper:
                         # Retry.
                         # --------------------------------------------------
 
+                        is_redirect = _is_redirect_error(exc)
+
                         if (
                             attempt
                             < retry_count
-                            and
-                            structured_error.should_retry(
-                                retry_count
+                            and (
+                                is_redirect
+                                or structured_error.should_retry(
+                                    retry_count
+                                )
                             )
                         ):
 
-                            if _is_redirect_error(
-                                exc
-                            ):
+                            if is_redirect:
 
                                 wait_time = random.uniform(
                                     REDIRECT_RETRY_DELAY_MIN,
@@ -1608,9 +1616,7 @@ class UltraOptimizedScraper:
                                     NORMAL_RETRY_DELAY_MAX,
                                 )
 
-                            await asyncio.sleep(
-                                wait_time
-                            )
+                            await asyncio.sleep(wait_time)
 
                             continue
 
@@ -1618,7 +1624,13 @@ class UltraOptimizedScraper:
 
                     finally:
 
-                        if page:
+                        # --------------------------------------------------
+                        # Every attempt owns exactly one context.
+                        # Release it before the next retry, and also
+                        # on success (the return path reaches here).
+                        # --------------------------------------------------
+
+                        if page is not None:
 
                             try:
 
@@ -1627,6 +1639,30 @@ class UltraOptimizedScraper:
                             except Exception:
 
                                 pass
+
+                            page = None
+
+                        if context is not None:
+
+                            try:
+
+                                await self.browser_manager.release_context(
+                                    context
+                                )
+
+                            except Exception as release_exc:
+
+                                logger.logger.warning(
+                                    (
+                                        "[OVERVIEW] "
+                                        f"Page {page_num}: "
+                                        "failed to release "
+                                        "browser context: "
+                                        f"{release_exc}"
+                                    )
+                                )
+
+                            context = None
 
             finally:
 
