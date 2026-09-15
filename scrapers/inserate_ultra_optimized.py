@@ -1260,12 +1260,22 @@ class UltraOptimizedScraper:
                             Page
                         ] = None
 
-                        context = (
-                            await self.browser_manager.get_context()
-                        )
+                        async def _acquire_and_navigate():
+                            nonlocal context, page
 
-                        page = (
-                            await context.new_page()
+                            context = (
+                                await self.browser_manager.get_context()
+                            )
+
+                            page = (
+                                await context.new_page()
+                            )
+
+                        # Concurrency limiter: begrenzt gleichzeitig offene
+                        # Page-Fetches über alle parallelen Seiten hinweg,
+                        # nicht die Context-Anzahl selbst.
+                        await self.browser_manager.execute_with_semaphore(
+                            _acquire_and_navigate()
                         )
 
                         # --------------------------------------------------
@@ -1943,516 +1953,237 @@ class UltraOptimizedScraper:
 
             seen_adids = set()
 
-            visited_page_urls = set()
-
-            page_num = 1
-
             stop_reason = None
 
-            discovered_total_result_count = (
-                None
-            )
-
-            discovered_total_pages = (
-                None
-            )
+            discovered_total_result_count = None
+            discovered_total_pages = None
 
             total_extracted = 0
-
             total_new_results = 0
-
             total_duplicates = 0
 
             # --------------------------------------------------------------
-            # Pagination loop.
-            # ----------------------------------------------------------
-            # Each call to ultra_optimized_fetch_page acquires its own
-            # BrowserContext from the pool and releases it when done.
-            # No persistent context is held across pages — this avoids
-            # Kleinanzeigen session accumulation that triggers
-            # ERR_TOO_MANY_REDIRECTS after ~6 sequential navigations.
-            # ----------------------------------------------------------
+            # Seite 1: sequentiell, liefert total_result_count/total_pages
+            # --------------------------------------------------------------
 
-            while True:
+            (
+                page1_results,
+                page1_metrics,
+                page1_extras,
+                _unused_next_url,
+            ) = await self.ultra_optimized_fetch_page(
+                url=current_page_url,
+                page_num=1,
+            )
 
-                    if (
-                        effective_page_count
-                        is not None
-                        and page_num
-                        > effective_page_count
-                    ):
+            all_metrics.append(page1_metrics)
+            tracker.add_page_metric(page1_metrics)
 
-                        stop_reason = (
-                            "automatic_page_limit_reached"
-                            if requested_page_count
-                            is None
-                            else
-                            "page_count_limit_reached"
+            if page1_extras.get("total_result_count") is not None:
+                discovered_total_result_count = page1_extras["total_result_count"]
+                discovered_total_pages = (
+                    discovered_total_result_count + RESULTS_PER_PAGE - 1
+                ) // RESULTS_PER_PAGE
+
+            if not page1_metrics.success:
+                stop_reason = "page_fetch_failed"
+                page_details.append({
+                    "page_number": 1,
+                    "url": current_page_url,
+                    "canonical_url": page1_extras.get("canonical_url"),
+                    "success": False,
+                    "extracted": 0,
+                    "new": 0,
+                    "duplicates": 0,
+                    "retry_count": page1_metrics.retry_count,
+                    "next_page_url": None,
+                    "error": page1_metrics.error_message,
+                    "navigation_error": page1_extras.get("navigation_error"),
+                    "navigation_status": page1_extras.get("navigation_status"),
+                })
+            else:
+                total_extracted += len(page1_results)
+
+                new_results = []
+                for result in page1_results:
+                    if not isinstance(result, dict):
+                        continue
+                    adid = result.get("adid")
+                    if adid:
+                        if adid in seen_adids:
+                            continue
+                        seen_adids.add(adid)
+                    new_results.append(result)
+
+                duplicate_count = len(page1_results) - len(new_results)
+                total_new_results += len(new_results)
+                total_duplicates += duplicate_count
+
+                reached_min_publish_date = False
+                if min_publish_date and _page_has_old_listings(page1_results, min_publish_date):
+                    new_results = _filter_by_min_publish_date(new_results, min_publish_date)
+                    reached_min_publish_date = True
+
+                all_results.extend(new_results)
+
+                page_details.append({
+                    "page_number": 1,
+                    "url": current_page_url,
+                    "canonical_url": page1_extras.get("canonical_url"),
+                    "success": True,
+                    "extracted": len(page1_results),
+                    "new": len(new_results),
+                    "duplicates": duplicate_count,
+                    "retry_count": page1_metrics.retry_count,
+                    "next_page_url": page1_extras.get("next_page_url"),
+                    "error": None,
+                    "navigation_error": None,
+                    "navigation_status": page1_extras.get("navigation_status"),
+                    "context_cookie_count": page1_extras.get("context_cookie_count"),
+                })
+
+                if not page1_results:
+                    stop_reason = "empty_page"
+                elif not new_results:
+                    stop_reason = "no_new_results"
+                elif reached_min_publish_date:
+                    stop_reason = "min_publish_date_reached"
+
+            # --------------------------------------------------------------
+            # Seiten 2..N: parallel, URLs via inject_page() gebaut
+            # (behält Query/Kategorie/Filter korrekt bei — Fix.txt)
+            # --------------------------------------------------------------
+
+            if stop_reason is None:
+
+                if discovered_total_pages is not None:
+                    last_page = min(discovered_total_pages, effective_page_count)
+                else:
+                    last_page = effective_page_count
+
+                if last_page >= 2:
+
+                    fetch_tasks = [
+                        self.ultra_optimized_fetch_page(
+                            url=_inject_page(current_page_url, page_num),
+                            page_num=page_num,
                         )
-
-                        break
-
-                    normalized_url = (
-                        _normalize_url(
-                            current_page_url
-                        )
-                    )
-
-                    if (
-                        normalized_url
-                        in visited_page_urls
-                    ):
-
-                        logger.logger.warning(
-                            (
-                                "[OVERVIEW] "
-                                "Pagination returned "
-                                "an already visited "
-                                f"URL on page "
-                                f"{page_num}: "
-                                f"{current_page_url}"
-                            )
-                        )
-
-                        stop_reason = (
-                            "pagination_url_repeated"
-                        )
-
-                        break
-
-                    visited_page_urls.add(
-                        normalized_url
-                    )
+                        for page_num in range(2, last_page + 1)
+                    ]
 
                     logger.logger.info(
-                        (
-                            "[OVERVIEW] "
-                            f"Fetching page "
-                            f"{page_num}: "
-                            f"{current_page_url}"
-                        )
+                        f"[OVERVIEW] Fetching pages 2..{last_page} in parallel "
+                        f"({len(fetch_tasks)} pages, semaphore-limited)"
                     )
 
-                    try:
-
-                        (
-                            page_results,
-                            page_metrics,
-                            page_extras,
-                            next_page_url,
-                        ) = (
-                            await self.ultra_optimized_fetch_page(
-                                url=current_page_url,
-                                page_num=page_num,
-                            )
-                        )
-
-                    except Exception as exc:
-
-                        logger.log_error(
-                            ErrorClassifier.classify_exception(
-                                exc,
-                                ErrorContext(
-                                    operation=(
-                                        "sequential_page_fetch"
-                                    ),
-                                    page_number=(
-                                        page_num
-                                    ),
-                                    url=(
-                                        current_page_url
-                                    ),
-                                ),
-                                "page_execution",
-                            )
-                        )
-
-                        stop_reason = (
-                            "page_fetch_exception"
-                        )
-
-                        break
-
-                    all_metrics.append(
-                        page_metrics
+                    batch_results = await asyncio.gather(
+                        *fetch_tasks, return_exceptions=True
                     )
 
-                    tracker.add_page_metric(
-                        page_metrics
-                    )
-
-                    # ------------------------------------------------------
-                    # Total-result information
-                    # ------------------------------------------------------
-
-                    if (
-                        page_extras.get(
-                            "total_result_count"
-                        )
-                        is not None
+                    for page_num, result in zip(
+                        range(2, last_page + 1), batch_results
                     ):
-
-                        discovered_total_result_count = (
-                            page_extras[
-                                "total_result_count"
-                            ]
-                        )
-
-                        discovered_total_pages = (
-                            (
-                                discovered_total_result_count
-                                + RESULTS_PER_PAGE
-                                - 1
+                        if isinstance(result, Exception):
+                            logger.log_error(
+                                ErrorClassifier.classify_exception(
+                                    result,
+                                    ErrorContext(
+                                        operation="parallel_page_fetch",
+                                        page_number=page_num,
+                                        url=current_page_url,
+                                    ),
+                                    "page_execution",
+                                )
                             )
-                            // RESULTS_PER_PAGE
-                        )
-
-                    # ------------------------------------------------------
-                    # Failed page
-                    # ------------------------------------------------------
-
-                    if not page_metrics.success:
-
-                        page_detail = {
-                            "page_number": (
-                                page_num
-                            ),
-                            "url": (
-                                current_page_url
-                            ),
-                            "canonical_url": (
-                                page_extras.get(
-                                    "canonical_url"
-                                )
-                            ),
-                            "success": False,
-                            "extracted": 0,
-                            "new": 0,
-                            "duplicates": 0,
-                            "retry_count": (
-                                page_metrics.retry_count
-                            ),
-                            "next_page_url": None,
-                            "error": (
-                                page_metrics.error_message
-                            ),
-                            "navigation_error": (
-                                page_extras.get(
-                                    "navigation_error"
-                                )
-                            ),
-                            "navigation_status": (
-                                page_extras.get(
-                                    "navigation_status"
-                                )
-                            ),
-                        }
-
-                        page_details.append(
-                            page_detail
-                        )
-
-                        logger.logger.warning(
-                            (
-                                "[OVERVIEW] "
-                                f"Page {page_num} "
-                                "failed. "
-                                f"error="
-                                f"{page_metrics.error_message}"
-                            )
-                        )
-
-                        stop_reason = (
-                            "page_fetch_failed"
-                        )
-
-                        break
-
-                    # ------------------------------------------------------
-                    # Successful page
-                    # ------------------------------------------------------
-
-                    total_extracted += (
-                        len(page_results)
-                    )
-
-                    # ------------------------------------------------------
-                    # Empty page
-                    # ------------------------------------------------------
-
-                    if not page_results:
-
-                        page_details.append(
-                            {
-                                "page_number": (
-                                    page_num
-                                ),
-                                "url": (
-                                    current_page_url
-                                ),
-                                "canonical_url": (
-                                    page_extras.get(
-                                        "canonical_url"
-                                    )
-                                ),
-                                "success": True,
+                            page_details.append({
+                                "page_number": page_num,
+                                "url": _inject_page(current_page_url, page_num),
+                                "canonical_url": None,
+                                "success": False,
                                 "extracted": 0,
                                 "new": 0,
                                 "duplicates": 0,
-                                "retry_count": (
-                                    page_metrics.retry_count
-                                ),
-                                "next_page_url": (
-                                    next_page_url
-                                ),
-                                "error": None,
-                                "navigation_error": None,
-                                "navigation_status": (
-                                    page_extras.get(
-                                        "navigation_status"
-                                    )
-                                ),
-                            }
-                        )
-
-                        stop_reason = (
-                            "empty_page"
-                        )
-
-                        break
-
-                    # ------------------------------------------------------
-                    # Deduplication
-                    # ------------------------------------------------------
-
-                    new_results = []
-
-                    for result in page_results:
-
-                        if not isinstance(
-                            result,
-                            dict,
-                        ):
+                                "retry_count": 0,
+                                "next_page_url": None,
+                                "error": str(result),
+                                "navigation_error": str(result),
+                                "navigation_status": None,
+                            })
                             continue
 
-                        adid = result.get(
-                            "adid"
-                        )
+                        page_results, page_metrics, page_extras, _next_url = result
 
-                        if not adid:
+                        all_metrics.append(page_metrics)
+                        tracker.add_page_metric(page_metrics)
 
-                            new_results.append(
-                                result
-                            )
-
+                        if not page_metrics.success:
+                            page_details.append({
+                                "page_number": page_num,
+                                "url": _inject_page(current_page_url, page_num),
+                                "canonical_url": page_extras.get("canonical_url"),
+                                "success": False,
+                                "extracted": 0,
+                                "new": 0,
+                                "duplicates": 0,
+                                "retry_count": page_metrics.retry_count,
+                                "next_page_url": None,
+                                "error": page_metrics.error_message,
+                                "navigation_error": page_extras.get("navigation_error"),
+                                "navigation_status": page_extras.get("navigation_status"),
+                            })
                             continue
 
-                        if adid in seen_adids:
+                        total_extracted += len(page_results)
 
-                            continue
+                        new_results = []
+                        for result_item in page_results:
+                            if not isinstance(result_item, dict):
+                                continue
+                            adid = result_item.get("adid")
+                            if adid:
+                                if adid in seen_adids:
+                                    continue
+                                seen_adids.add(adid)
+                            new_results.append(result_item)
 
-                        seen_adids.add(
-                            adid
-                        )
+                        duplicate_count = len(page_results) - len(new_results)
+                        total_new_results += len(new_results)
+                        total_duplicates += duplicate_count
 
-                        new_results.append(
-                            result
-                        )
+                        if min_publish_date and _page_has_old_listings(page_results, min_publish_date):
+                            new_results = _filter_by_min_publish_date(new_results, min_publish_date)
 
-                    duplicate_count = (
-                        len(page_results)
-                        - len(new_results)
-                    )
+                        all_results.extend(new_results)
 
-                    total_new_results += (
-                        len(new_results)
-                    )
-
-                    total_duplicates += (
-                        duplicate_count
-                    )
-
-                    logger.logger.info(
-                        (
-                            "[OVERVIEW] "
-                            f"Page {page_num}: "
-                            f"{len(page_results)} "
-                            "extracted, "
-                            f"{len(new_results)} "
-                            "new, "
-                            f"{duplicate_count} "
-                            "duplicates"
-                        )
-                    )
-
-                    # ------------------------------------------------------
-                    # Publication date
-                    # ------------------------------------------------------
-
-                    reached_min_publish_date = (
-                        False
-                    )
-
-                    if min_publish_date:
-
-                        if _page_has_old_listings(
-                            page_results,
-                            min_publish_date,
-                        ):
-
-                            new_results = (
-                                _filter_by_min_publish_date(
-                                    new_results,
-                                    min_publish_date,
-                                )
-                            )
-
-                            reached_min_publish_date = (
-                                True
-                            )
-
-                    # ------------------------------------------------------
-                    # Add results
-                    # ------------------------------------------------------
-
-                    all_results.extend(
-                        new_results
-                    )
-
-                    # ------------------------------------------------------
-                    # Page diagnostics
-                    # ------------------------------------------------------
-
-                    page_details.append(
-                        {
-                            "page_number": (
-                                page_num
-                            ),
-                            "url": (
-                                current_page_url
-                            ),
-                            "canonical_url": (
-                                page_extras.get(
-                                    "canonical_url"
-                                )
-                            ),
+                        page_details.append({
+                            "page_number": page_num,
+                            "url": _inject_page(current_page_url, page_num),
+                            "canonical_url": page_extras.get("canonical_url"),
                             "success": True,
-                            "extracted": (
-                                len(page_results)
-                            ),
-                            "new": (
-                                len(new_results)
-                            ),
-                            "duplicates": (
-                                duplicate_count
-                            ),
-                            "retry_count": (
-                                page_metrics.retry_count
-                            ),
-                            "next_page_url": (
-                                next_page_url
-                            ),
+                            "extracted": len(page_results),
+                            "new": len(new_results),
+                            "duplicates": duplicate_count,
+                            "retry_count": page_metrics.retry_count,
+                            "next_page_url": None,
                             "error": None,
                             "navigation_error": None,
-                            "navigation_status": (
-                                page_extras.get(
-                                    "navigation_status"
-                                )
-                            ),
-                            "context_cookie_count": (
-                                page_extras.get(
-                                    "context_cookie_count"
-                                )
-                            ),
-                        }
-                    )
+                            "navigation_status": page_extras.get("navigation_status"),
+                            "context_cookie_count": page_extras.get("context_cookie_count"),
+                        })
 
-                    # ------------------------------------------------------
-                    # No new results
-                    # ------------------------------------------------------
-
-                    if not new_results:
-
-                        stop_reason = (
-                            "no_new_results"
-                        )
-
-                        break
-
-                    # ------------------------------------------------------
-                    # Publication-date stop
-                    # ------------------------------------------------------
-
-                    if (
-                        reached_min_publish_date
-                    ):
-
-                        stop_reason = (
-                            "min_publish_date_reached"
-                        )
-
-                        break
-
-                    # ------------------------------------------------------
-                    # Pagination exhausted
-                    # ------------------------------------------------------
-
-                    if not next_page_url:
-
-                        logger.logger.info(
-                            (
-                                "[OVERVIEW] "
-                                f"Page {page_num} "
-                                "has no next page."
-                            )
-                        )
-
-                        stop_reason = (
-                            "no_next_page"
-                        )
-
-                        break
-
-                    # ------------------------------------------------------
-                    # Total result count exhausted
-                    # ------------------------------------------------------
-
-                    if (
-                        discovered_total_pages
-                        is not None
-                    ):
-
-                        if (
-                            page_num
-                            >= discovered_total_pages
-                        ):
-
-                            stop_reason = (
-                                "total_result_count_exhausted"
-                            )
-
-                            break
-
-                    # ------------------------------------------------------
-                    # Continue pagination
-                    # ------------------------------------------------------
-
-                    current_page_url = (
-                        next_page_url
-                    )
-
-                    page_num += 1
-
-                    if page_num % 5 == 0:
-
-                        gc.collect()
-
-                    await asyncio.sleep(
-                        random.uniform(
-                            PAGE_DELAY_MIN,
-                            PAGE_DELAY_MAX,
+                    stop_reason = (
+                        "total_result_count_exhausted"
+                        if discovered_total_pages is not None
+                        else (
+                            "automatic_page_limit_reached"
+                            if requested_page_count is None
+                            else "page_count_limit_reached"
                         )
                     )
+                else:
+                    stop_reason = stop_reason or "single_page_result"
+
+            gc.collect()
 
             # --------------------------------------------------------------
             # Final deduplication
